@@ -1,0 +1,469 @@
+<!doctype html>
+<!--
+  PROTOTYPE — throwaway. Answers wayfinder ticket "What should the dashboard look like?"
+  Four structurally different dashboard variants on one page, switchable via ?variant=A|B|C|D
+  (or ← / → keys, or the floating bar). All data is fake and in memory; buttons do nothing real.
+  Run: open this file in a browser (double-click), or `npx serve prototype/dashboard`.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PROTOTYPE · Orchestrator dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font:14px/1.45 "Inter","Segoe UI Variable","Segoe UI",system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+  .mono{font-family:"JetBrains Mono","Cascadia Code",Consolas,ui-monospace,monospace}
+  button{font:inherit;cursor:pointer;border:0;background:none;color:inherit}
+  .tabnum{font-variant-numeric:tabular-nums}
+
+  /* ---------- shared bits ---------- */
+  .tier{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;padding:2px 8px 2px 6px;border-radius:999px;white-space:nowrap;
+        background:color-mix(in srgb,var(--c) 16%,transparent);color:var(--c);border:1px solid color-mix(in srgb,var(--c) 35%,transparent)}
+  .tier i{width:6px;height:6px;border-radius:50%;background:var(--c)}
+  .pulse{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 0 #22c55e88;animation:pulse 1.6s infinite;display:inline-block}
+  @keyframes pulse{70%{box-shadow:0 0 0 7px #22c55e00}100%{box-shadow:0 0 0 0 #22c55e00}}
+  .log{font-family:"JetBrains Mono","Cascadia Code",Consolas,monospace;font-size:12px;line-height:1.6;overflow:hidden}
+  .log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .log div.new{animation:fadein .35s}
+  @keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1}}
+  .l-tool{color:#7dd3fc}.l-ok{color:#4ade80}.l-err{color:#f87171}.l-think{color:#94a3b8;font-style:italic}.l-esc{color:#fbbf24;font-weight:600}.l-txt{color:#e2e8f0}
+  .light .l-txt{color:#1e293b}.light .l-think{color:#64748b}.light .l-tool{color:#0369a1}.light .l-ok{color:#15803d}.light .l-err{color:#b91c1c}.light .l-esc{color:#b45309}
+
+  /* ---------- prototype switcher (not part of the design) ---------- */
+  #switcher{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:9999;display:flex;align-items:center;gap:4px;
+    background:#ff2d75;color:#fff;border-radius:999px;padding:4px;box-shadow:0 8px 30px #0006;font:600 13px system-ui}
+  #switcher button{width:30px;height:30px;border-radius:50%;font-size:16px}
+  #switcher button:hover{background:#fff3}
+  #switcher span{padding:0 10px;min-width:230px;text-align:center}
+  #switcher small{opacity:.75;font-weight:500}
+
+  /* =========================================================
+     A · MISSION CONTROL — three panes, dark, dense
+     ========================================================= */
+  .A{height:100vh;display:grid;grid-template-rows:56px 1fr;background:#0b0d12;color:#e5e7eb}
+  .A header{display:flex;align-items:center;gap:18px;padding:0 20px;border-bottom:1px solid #1c212b;background:#0e1118}
+  .A .logo{font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}
+  .A .logo b{width:22px;height:22px;border-radius:6px;background:conic-gradient(from 200deg,#2dd4bf,#60a5fa,#a78bfa,#fbbf24,#2dd4bf)}
+  .A .repo{padding:5px 10px;border:1px solid #232937;border-radius:8px;color:#cbd5e1;font-size:13px}
+  .A .phases{display:flex;gap:4px;margin-left:auto;font-size:12.5px}
+  .A .phases span{padding:5px 12px;border-radius:999px;background:#151a23;color:#64748b}
+  .A .phases .done{color:#4ade80}.A .phases .now{background:#1d2533;color:#fff}
+  .A main{display:grid;grid-template-columns:340px 1fr 360px;min-height:0}
+  .A section{min-height:0;display:flex;flex-direction:column}
+  .A h3{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#64748b;font-weight:600;padding:16px 18px 10px}
+  .A .chat{border-right:1px solid #1c212b;background:#0d1016}
+  .A .msgs{flex:1;overflow:auto;padding:0 16px 16px;display:flex;flex-direction:column;gap:12px}
+  .A .m{padding:10px 12px;border-radius:12px;font-size:13px;max-width:92%}
+  .A .m.u{align-self:flex-end;background:#1e293b}
+  .A .m.p{background:#12161f;border:1px solid #1c212b}
+  .A .m.p strong{color:#c4b5fd;font-size:11px;display:block;margin-bottom:3px}
+  .A .ck{border:1px solid #4ade8055;background:#4ade800d;border-radius:12px;padding:12px;font-size:13px}
+  .A .ck .row{display:flex;justify-content:space-between;margin-top:8px;align-items:center;color:#94a3b8;font-size:12px}
+  .A .ok{background:#4ade80;color:#052e16;font-weight:600;padding:6px 12px;border-radius:8px;font-size:12.5px}
+  .A .input{margin:12px;border:1px solid #232937;border-radius:12px;padding:12px;color:#475569;font-size:13px}
+  .A .board{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:0 16px 16px;overflow:auto;flex:1}
+  .A .col h4{font-size:12px;color:#94a3b8;font-weight:600;padding:6px 4px 10px;display:flex;justify-content:space-between}
+  .A .card{background:#121620;border:1px solid #1c212b;border-radius:12px;padding:12px;margin-bottom:10px;cursor:pointer;transition:.15s}
+  .A .card:hover{border-color:#334155;transform:translateY(-1px)}
+  .A .card.sel{border-color:#60a5fa;box-shadow:0 0 0 3px #60a5fa22}
+  .A .card .t{font-size:13px;font-weight:500;margin:6px 0 10px}
+  .A .card .meta{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;color:#64748b}
+  .A .card .n{color:#64748b;font-size:11.5px}
+  .A .esc{color:#fbbf24;font-size:11px}
+  .A .stuck{border-color:#f8717166;background:#1a1114}
+  .A .side{border-left:1px solid #1c212b;background:#0d1016}
+  .A .meter{padding:0 18px 18px;border-bottom:1px solid #1c212b}
+  .A .big{font-size:34px;font-weight:700;letter-spacing:-.03em}
+  .A .big small{font-size:14px;color:#64748b;font-weight:500}
+  .A .bar{height:8px;border-radius:99px;background:#1c212b;display:flex;overflow:hidden;margin:10px 0 6px}
+  .A .q{display:flex;justify-content:space-between;font-size:12px;color:#94a3b8;margin-top:10px}
+  .A .qb{height:4px;border-radius:99px;background:#1c212b;margin-top:4px}
+  .A .qb i{display:block;height:100%;border-radius:99px}
+  .A .term{flex:1;margin:0 14px 14px;background:#07090d;border:1px solid #1c212b;border-radius:12px;padding:12px;display:flex;flex-direction:column;min-height:0}
+  .A .term .hd{display:flex;align-items:center;gap:8px;font-size:12px;color:#94a3b8;margin-bottom:8px}
+  .A .term .log{flex:1}
+
+  /* =========================================================
+     B · TIER LADDER — swimlanes by Model Tier, terminals docked
+     ========================================================= */
+  .B{height:100vh;display:grid;grid-template-rows:auto 1fr 250px;background:radial-gradient(1200px 500px at 80% -10%,#1e1b4b 0,#0a0b1a 60%);color:#e0e7ff}
+  .B .hero{display:flex;align-items:flex-end;gap:40px;padding:26px 32px 18px}
+  .B .hero h1{font-size:13px;font-weight:600;color:#a5b4fc;letter-spacing:.04em}
+  .B .hero .v{font-size:44px;font-weight:700;letter-spacing:-.04em;line-height:1}
+  .B .hero .v small{font-size:15px;color:#818cf8;font-weight:500;margin-left:6px}
+  .B .stat{display:flex;flex-direction:column;gap:6px}
+  .B .stat .l{font-size:12px;color:#818cf8}
+  .B .stat .s{font-size:22px;font-weight:600}
+  .B .ring{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;font-size:11px;font-weight:700}
+  .B .ask{margin-left:auto;background:#6366f1;color:#fff;padding:10px 16px;border-radius:10px;font-weight:600;box-shadow:0 6px 24px #6366f155}
+  .B .ask kbd{opacity:.7;font-size:11px;margin-left:6px}
+  .B .ladder{margin:0 32px;border:1px solid #ffffff14;border-radius:16px;background:#ffffff06;display:grid;grid-template-columns:200px repeat(5,1fr);overflow:hidden;position:relative}
+  .B .ladder .hcell{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#818cf8;padding:10px 12px;border-bottom:1px solid #ffffff12}
+  .B .lane{padding:12px 14px;border-bottom:1px solid #ffffff0d;display:flex;flex-direction:column;justify-content:center;gap:3px}
+  .B .lane b{font-size:14px}.B .lane span{font-size:11.5px;color:#a5b4fc}
+  .B .cell{border-bottom:1px solid #ffffff0d;border-left:1px dashed #ffffff0d;padding:8px;display:flex;flex-direction:column;gap:6px;justify-content:center}
+  .B .chip{border-radius:10px;padding:7px 10px;font-size:12px;background:color-mix(in srgb,var(--c) 14%,#0a0b1a);border:1px solid color-mix(in srgb,var(--c) 45%,transparent);display:flex;gap:6px;align-items:center}
+  .B .chip em{font-style:normal;color:var(--c);font-weight:600}
+  .B .chip.ghost{opacity:.35;border-style:dashed;text-decoration:line-through}
+  .B .chip.stuck{background:#450a0a;border-color:#f87171}
+  .B .dock{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:16px 32px 70px}
+  .B .tile{background:#05060fcc;border:1px solid #ffffff14;border-radius:14px;padding:12px 14px;display:flex;flex-direction:column;min-height:0;backdrop-filter:blur(6px)}
+  .B .tile .hd{display:flex;gap:8px;align-items:center;font-size:12px;margin-bottom:8px}
+  .B .tile .hd .r{margin-left:auto;color:#818cf8}
+  .B .tile .log{flex:1}
+  .B .drawer{position:fixed;top:0;right:0;bottom:0;width:420px;background:#0f1029;border-left:1px solid #ffffff1a;box-shadow:-20px 0 60px #0008;transform:translateX(100%);transition:.3s cubic-bezier(.2,.8,.2,1);display:flex;flex-direction:column;z-index:10}
+  .B .drawer.open{transform:none}
+  .B .drawer .msgs{flex:1;overflow:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+  .B .drawer .m{padding:10px 13px;border-radius:12px;font-size:13px;background:#1e1b4b;max-width:90%}
+  .B .drawer .m.u{align-self:flex-end;background:#312e81}
+  .B .drawer header{padding:16px 20px;border-bottom:1px solid #ffffff14;display:flex;justify-content:space-between;font-weight:600}
+
+  /* =========================================================
+     C · CONVERSATION-FIRST — the Planner thread is the app
+     ========================================================= */
+  .C{min-height:100vh;background:#faf8f5;color:#1c1917;display:grid;grid-template-columns:240px 1fr 300px}
+  .C nav{border-right:1px solid #ece7e0;padding:22px 16px;display:flex;flex-direction:column;gap:4px;position:sticky;top:0;height:100vh}
+  .C nav .brand{font-family:Georgia,"Times New Roman",serif;font-size:20px;margin-bottom:18px;padding:0 8px}
+  .C nav a{padding:8px 10px;border-radius:8px;font-size:13.5px;color:#57534e;display:flex;justify-content:space-between}
+  .C nav a.on{background:#f0ebe4;color:#1c1917;font-weight:600}
+  .C nav a small{color:#a8a29e}
+  .C .thread{max-width:760px;width:100%;margin:0 auto;padding:40px 28px 140px;display:flex;flex-direction:column;gap:22px}
+  .C .who{font-size:12px;font-weight:600;color:#78716c;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+  .C .who .av{width:22px;height:22px;border-radius:50%;background:#1c1917;color:#faf8f5;display:grid;place-items:center;font-size:11px}
+  .C .who .av.me{background:#d6d3d1;color:#1c1917}
+  .C .txt{font-size:15px;line-height:1.6}
+  .C .sys{display:flex;align-items:center;gap:10px;font-size:12.5px;color:#a8a29e}
+  .C .sys::before,.C .sys::after{content:"";flex:1;height:1px;background:#ece7e0}
+  .C .tk{background:#fff;border:1px solid #ece7e0;border-radius:14px;overflow:hidden;box-shadow:0 1px 2px #0000000a}
+  .C .tk .top{display:flex;align-items:center;gap:10px;padding:12px 16px}
+  .C .tk .top .t{font-weight:600;flex:1}
+  .C .tk .top .n{color:#a8a29e;font-size:12.5px}
+  .C .tk .log{background:#1c1917;padding:12px 16px;height:118px}
+  .C .act{display:flex;gap:8px;padding:12px 16px;border-top:1px solid #f3efe9;background:#fcfbf9;align-items:center;font-size:12.5px;color:#78716c}
+  .C .act .go{margin-left:auto;background:#1c1917;color:#fff;padding:7px 14px;border-radius:8px;font-weight:600}
+  .C .act .alt{border:1px solid #d6d3d1;padding:6px 12px;border-radius:8px;color:#1c1917}
+  .C .plan{border:1px solid #ece7e0;border-radius:14px;background:#fff}
+  .C .plan li{list-style:none;display:flex;gap:10px;align-items:center;padding:9px 16px;border-top:1px solid #f3efe9;font-size:13.5px}
+  .C .plan li:first-child{border-top:0}
+  .C .plan li .e{margin-left:auto;color:#a8a29e;font-size:12.5px}
+  .C .composer{position:fixed;bottom:66px;left:calc(240px + (100vw - 540px)/2);transform:translateX(-50%);width:min(720px,calc(100vw - 600px));background:#fff;border:1px solid #e7e1d9;border-radius:16px;padding:14px 16px;box-shadow:0 10px 40px #1c191714;color:#a8a29e}
+  .C aside{padding:28px 22px;position:sticky;top:0;height:100vh;border-left:1px solid #ece7e0}
+  .C aside h5{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#a8a29e;margin:22px 0 10px}
+  .C aside h5:first-child{margin-top:0}
+  .C .dollars{font-family:Georgia,serif;font-size:40px;letter-spacing:-.02em}
+  .C .dollars small{font-size:14px;color:#a8a29e;font-family:inherit}
+  .C .row{display:flex;justify-content:space-between;font-size:12.5px;color:#57534e;margin-top:8px}
+  .C .bar{height:6px;background:#f0ebe4;border-radius:9px;margin-top:5px;overflow:hidden}
+  .C .bar i{display:block;height:100%;border-radius:9px;background:#1c1917}
+  .C .tier{--c:#57534e}
+
+  /* =========================================================
+     D · CHECKPOINT INBOX — list grouped by what needs you
+     ========================================================= */
+  .D{height:100vh;display:grid;grid-template-columns:220px 1fr 440px;background:#fff;color:#0f172a}
+  .D nav{background:#f8fafc;border-right:1px solid #e2e8f0;padding:16px 12px}
+  .D nav .brand{font-weight:700;padding:4px 8px 16px;display:flex;gap:8px;align-items:center}
+  .D nav .brand b{width:18px;height:18px;border-radius:5px;background:#0f172a}
+  .D nav a{display:flex;justify-content:space-between;padding:7px 10px;border-radius:7px;font-size:13px;color:#475569}
+  .D nav a.on{background:#e2e8f0;color:#0f172a;font-weight:600}
+  .D nav a .badge{background:#ef4444;color:#fff;border-radius:99px;font-size:11px;padding:0 7px;font-weight:700}
+  .D .center{display:flex;flex-direction:column;min-width:0}
+  .D .costbar{padding:16px 24px;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;gap:24px}
+  .D .costbar .k{font-size:11.5px;color:#64748b}.D .costbar .v{font-size:18px;font-weight:700}
+  .D .seg{flex:1;display:flex;flex-direction:column;gap:6px}
+  .D .seg .s{height:10px;border-radius:5px;display:flex;overflow:hidden;background:#f1f5f9}
+  .D .seg .lg{display:flex;gap:14px;font-size:11.5px;color:#64748b}
+  .D .seg .lg i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+  .D .list{overflow:auto;flex:1;padding-bottom:70px}
+  .D .grp{padding:18px 24px 6px;font-size:12px;font-weight:700;color:#334155;display:flex;gap:8px;align-items:center}
+  .D .grp span{color:#94a3b8;font-weight:500}
+  .D .r{display:grid;grid-template-columns:46px 1fr 150px 110px 70px 64px;align-items:center;gap:12px;padding:9px 24px;font-size:13px;border-top:1px solid #f1f5f9;cursor:pointer}
+  .D .r:hover{background:#f8fafc}
+  .D .r.sel{background:#eff6ff;box-shadow:inset 3px 0 0 #3b82f6}
+  .D .r .n{color:#94a3b8}
+  .D .r .c{text-align:right;color:#475569}
+  .D .st{font-size:12px;display:flex;gap:6px;align-items:center;color:#475569}
+  .D .dot{width:8px;height:8px;border-radius:50%}
+  .D .btn{background:#0f172a;color:#fff;font-size:12px;font-weight:600;padding:4px 10px;border-radius:6px}
+  .D .detail{border-left:1px solid #e2e8f0;display:flex;flex-direction:column;min-height:0;padding:22px 22px 70px;gap:16px;background:#fcfdfe}
+  .D .detail h2{font-size:18px;letter-spacing:-.01em}
+  .D .hist{display:flex;flex-direction:column;gap:0}
+  .D .hist div{display:flex;gap:10px;align-items:center;font-size:12.5px;padding:7px 0;border-left:2px solid #e2e8f0;padding-left:14px;position:relative;color:#475569}
+  .D .hist div::before{content:"";position:absolute;left:-6px;width:10px;height:10px;border-radius:50%;background:#fff;border:2px solid var(--c,#94a3b8)}
+  .D .detail .term{flex:1;background:#0f172a;border-radius:12px;padding:14px;min-height:0;display:flex;flex-direction:column}
+  .D .detail .term .log{flex:1}
+  .D .tier{font-size:11px}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="switcher">
+  <button id="prev" title="Previous (←)">‹</button>
+  <span id="label"></span>
+  <button id="next" title="Next (→)">›</button>
+</div>
+
+<script>
+/* ---------------- fake data ---------------- */
+const TIERS = [
+  null,
+  {id:1, agent:'Codex',       model:'gpt-5-mini', effort:'medium', short:'Codex · mini',  c:'#2dd4bf', note:'ChatGPT quota'},
+  {id:2, agent:'Claude Code', model:'Sonnet',     effort:'medium', short:'Claude · Sonnet', c:'#60a5fa', note:'Claude Max quota'},
+  {id:3, agent:'Codex',       model:'gpt-5',      effort:'high',   short:'Codex · gpt-5 high', c:'#a78bfa', note:'API $'},
+  {id:4, agent:'Claude Code', model:'Opus',       effort:'high',   short:'Claude · Opus', c:'#fbbf24', note:'API $'},
+];
+const STATES = {queued:'Up next', running:'Running', review:'Awaiting merge', stuck:'Needs you', merged:'Merged'};
+const SC = {queued:'#94a3b8', running:'#22c55e', review:'#3b82f6', stuck:'#ef4444', merged:'#a855f7'};
+const T = [
+  {n:12, title:'Add recipe search endpoint',       tier:2, state:'running', spent:0.18, est:0.42, hist:[2]},
+  {n:16, title:'Export shopping list as CSV',      tier:2, state:'running', spent:0.11, est:0.30, hist:[1,2]},
+  {n:17, title:'Nutrition API client',             tier:3, state:'running', spent:0.34, est:0.65, hist:[3]},
+  {n:19, title:'Tag schema migration',             tier:4, state:'stuck',   spent:1.12, est:0.90, hist:[3,4], why:'Failed at top tier: migration test times out'},
+  {n:14, title:'Fix pagination off-by-one',        tier:1, state:'review',  spent:0.00, est:0.00, hist:[1], pr:43},
+  {n:20, title:'Shareable recipe card links',      tier:2, state:'review',  spent:0.22, est:0.25, hist:[2], pr:44},
+  {n:15, title:'Sign in with GitHub (OAuth)',      tier:4, state:'queued',  spent:0,    est:1.60, hist:[], blockedBy:12},
+  {n:18, title:'Dark mode toggle',                 tier:1, state:'queued',  spent:0,    est:0.00, hist:[]},
+  {n:13, title:'Unit tests for ingredient parser', tier:1, state:'merged',  spent:0.00, est:0.00, hist:[1], pr:41},
+];
+const PLANNER = 0.31;
+const QUOTA = [{name:'Claude Max · 5h window', pct:62, c:'#60a5fa'}, {name:'ChatGPT Plus · weekly', pct:31, c:'#2dd4bf'}];
+const CHAT = [
+  ['u','I want v2 of the recipe app: search, GitHub login, shopping list export, and nutrition info.'],
+  ['p','Got it. Two questions before I split this: should search cover ingredients or just titles? And is nutrition from an external API, or computed from our ingredient table?'],
+  ['u','Ingredients too. External API — Edamam is fine.'],
+  ['p','Plan drafted: 9 Tickets on acme/recipe-app. OAuth and the tag migration are rated hard (Opus). Six are routine and go to subscription quota first.'],
+];
+const SCRIPTS = {
+  12:[['think','Looking at how routes are registered'],['tool','Read src/routes/recipes.ts'],['tool','Grep "router.get" src/routes'],['txt','Adding GET /recipes/search?q='],['tool','Edit src/routes/recipes.ts (+38 −2)'],['tool','Edit src/db/queries.ts (+21)'],['tool','Bash pnpm test recipes'],['ok','✓ 14 passed'],['think','Ingredient match needs a join'],['tool','Edit src/db/queries.ts (+9 −3)'],['tool','Bash pnpm test'],['ok','✓ 62 passed']],
+  16:[['err','✗ codex·mini: csv test failed (quote escaping) — attempt 1'],['esc','↑ Escalated to Claude · Sonnet'],['tool','Read src/lib/export.ts'],['think','Fields with commas are not quoted'],['tool','Edit src/lib/export.ts (+12 −4)'],['tool','Bash pnpm test export'],['ok','✓ 6 passed'],['tool','Bash git push origin ticket/16'],['txt','Opening PR…']],
+  17:[['tool','exec ls src/integrations'],['txt','Creating src/integrations/edamam.ts'],['tool','apply_patch (+84)'],['tool','exec pnpm tsc --noEmit'],['err','✗ TS2339 property "kcal" does not exist'],['tool','apply_patch (+3 −1)'],['tool','exec pnpm tsc --noEmit'],['ok','✓ no errors'],['tool','exec pnpm test integrations'],['ok','✓ 9 passed']],
+  19:[['err','✗ Opus: test "migrates 10k tags" timed out after 120s'],['think','Batching inserts did not help; suspect missing index'],['err','Escalation ladder exhausted — waiting for you']],
+};
+const logs = {}; const cur = {};
+for (const k in SCRIPTS){ logs[k] = SCRIPTS[k].slice(0, 4).map(x=>x); cur[k]=4; }
+
+/* ---------------- helpers ---------------- */
+const $ = s => document.querySelector(s);
+const money = v => '$' + v.toFixed(2);
+const tier = (id, label) => { const t = TIERS[id]; return `<span class="tier" style="--c:${t.c}"><i></i>${label ?? t.short}</span>`; };
+const spent = () => PLANNER + T.reduce((a,t)=>a+t.spent,0);
+const remaining = () => T.filter(t=>t.state!=='merged').reduce((a,t)=>a+Math.max(0,t.est-t.spent),0);
+const byState = s => T.filter(t=>t.state===s);
+const allFrontier = () => T.length * 1.45; // what it would cost if everything ran on Opus
+const logDiv = (n, lines=12) => `<div class="log" data-log="${n}" data-lines="${lines}"></div>`;
+const fmt = ([k,s]) => `<div class="l-${k}">${k==='tool'?'› ':''}${s}</div>`;
+const spentByTier = () => [1,2,3,4].map(i=>T.filter(t=>t.tier===i).reduce((a,t)=>a+t.spent,0));
+let selected = 12;
+
+/* =========================================================
+   A · Mission Control
+   ========================================================= */
+function A(){
+  const cols = [['queued','Up next'],['running','Running'],['review','Awaiting merge'],['merged','Merged']];
+  const sbt = spentByTier(), tot = spent();
+  return `<div class="A">
+  <header>
+    <div class="logo"><b></b>Orchestrator</div>
+    <div class="repo">acme/recipe-app ▾</div>
+    <div class="phases"><span class="done">✓ Plan approved</span><span class="now"><span class="pulse"></span>&nbsp; Running unattended</span><span>Merge</span></div>
+  </header>
+  <main>
+    <section class="chat">
+      <h3>Planner · Claude Opus</h3>
+      <div class="msgs">
+        ${CHAT.map(([w,s])=>`<div class="m ${w}">${w==='p'?'<strong>Planner</strong>':''}${s}</div>`).join('')}
+        <div class="ck">✓ <b>Checkpoint passed</b> — plan approved<div class="row"><span>9 Tickets · est. ${money(T.reduce((a,t)=>a+t.est,0))}</span><span>2:14 pm</span></div></div>
+        <div class="ck" style="border-color:#f8717155;background:#f871710d">⚠ <b>Tag schema migration</b> failed at the top tier.<div class="row"><span>Re-plan with me, or take it yourself?</span><button class="ok" style="background:#f87171;color:#2a0a0a">Re-plan</button></div></div>
+      </div>
+      <div class="input">Ask the Planner…</div>
+    </section>
+    <section>
+      <h3>Tickets</h3>
+      <div class="board">
+        ${cols.map(([s,l])=>{
+          const items = s==='running' ? [...byState('running'),...byState('stuck')] : byState(s);
+          return `<div class="col"><h4>${l}<span>${items.length}</span></h4>${items.map(t=>`
+          <div class="card ${t.n===selected?'sel':''} ${t.state==='stuck'?'stuck':''}" data-sel="${t.n}">
+            <div class="meta"><span class="n">#${t.n}${t.blockedBy?` · blocked by #${t.blockedBy}`:''}</span>${t.state==='running'?'<span class="pulse"></span>':t.state==='stuck'?'<span style="color:#f87171">● needs you</span>':''}</div>
+            <div class="t">${t.title}</div>
+            <div class="meta">${tier(t.tier)}<span class="tabnum">${t.hist.length>1?`<span class="esc">↑${t.hist.length-1} </span>`:''}${t.spent?money(t.spent):t.tier<=2?'quota':'~'+money(t.est)}</span></div>
+            ${t.state==='review'?`<div class="meta" style="margin-top:10px"><span>PR #${t.pr} · checks ✓</span><button class="ok">Merge</button></div>`:''}
+          </div>`).join('')}</div>`;}).join('')}
+      </div>
+    </section>
+    <section class="side">
+      <h3>Cost</h3>
+      <div class="meter">
+        <div class="big tabnum" data-spent>${money(tot)} <small>spent · ~${money(remaining())} to go</small></div>
+        <div class="bar">${sbt.map((v,i)=>`<i style="width:${v/tot*100}%;background:${TIERS[i+1].c}"></i>`).join('')}<i style="width:${PLANNER/tot*100}%;background:#c4b5fd"></i></div>
+        <div style="font-size:12px;color:#4ade80">Saved ~${money(allFrontier()-tot)} vs. running everything on Opus</div>
+        ${QUOTA.map(q=>`<div class="q"><span>${q.name}</span><span>${q.pct}%</span></div><div class="qb"><i style="width:${q.pct}%;background:${q.c}"></i></div>`).join('')}
+      </div>
+      <h3>Live · #${selected}</h3>
+      <div class="term">
+        <div class="hd">${T.find(t=>t.n===selected).state==='running'?'<span class="pulse"></span>':''}${tier(T.find(t=>t.n===selected).tier)}<span>${T.find(t=>t.n===selected).title}</span></div>
+        ${SCRIPTS[selected]?logDiv(selected,22):'<div style="color:#475569;font-size:12px">No live run for this Ticket.</div>'}
+      </div>
+    </section>
+  </main></div>`;
+}
+
+/* =========================================================
+   B · Tier Ladder
+   ========================================================= */
+function B(){
+  const cols = ['queued','running','stuck','review','merged'];
+  const tot = spent();
+  const ring = (p,c) => `<div class="ring" style="background:conic-gradient(${c} ${p*3.6}deg,#ffffff14 0)"><div class="ring" style="width:42px;height:42px;background:#12123a">${p}%</div></div>`;
+  return `<div class="B">
+    <div class="hero">
+      <div><h1>ACME/RECIPE-APP · RUNNING UNATTENDED</h1><div class="v tabnum" data-spent>${money(tot)}<small>spent of ~${money(tot+remaining())}</small></div></div>
+      <div class="stat"><span class="l">Saved vs. all-Opus</span><span class="s" style="color:#4ade80">${money(allFrontier()-tot)}</span></div>
+      <div class="stat"><span class="l">Escalations</span><span class="s">2</span></div>
+      ${QUOTA.map(q=>`<div class="stat" style="flex-direction:row;align-items:center;gap:10px">${ring(q.pct,q.c)}<span class="l" style="max-width:90px">${q.name}</span></div>`).join('')}
+      <button class="ask" data-drawer>Ask the Planner <kbd>⌘K</kbd></button>
+    </div>
+    <div>
+      <div class="ladder">
+        <div class="hcell">Model Tier</div>${cols.map(c=>`<div class="hcell">${STATES[c]}</div>`).join('')}
+        ${[4,3,2,1].map(i=>{const tr=TIERS[i];return `
+          <div class="lane" style="box-shadow:inset 3px 0 0 ${tr.c}"><b>${tr.short}</b><span>${tr.note} · effort ${tr.effort}</span></div>
+          ${cols.map(c=>`<div class="cell">${T.filter(t=>t.state===c&&t.tier===i).map(t=>`<div class="chip ${c==='stuck'?'stuck':''}" style="--c:${tr.c}">${c==='running'?'<span class="pulse"></span>':''}<em>#${t.n}</em>${t.title}${t.hist.length>1?' <span style="color:#fbbf24">↑</span>':''}</div>`).join('')}
+            ${T.filter(t=>t.hist.length>1&&t.hist[0]===i&&c==='running'&&t.state!=='stuck').map(t=>`<div class="chip ghost" style="--c:${tr.c}"><em>#${t.n}</em>failed here</div>`).join('')}
+            ${T.filter(t=>t.hist.length>1&&t.hist[0]===i&&c==='stuck').map(t=>`<div class="chip ghost" style="--c:${tr.c}"><em>#${t.n}</em>failed here</div>`).join('')}
+          </div>`).join('')}`;}).join('')}
+      </div>
+    </div>
+    <div class="dock">
+      ${[12,16,17].map(n=>{const t=T.find(x=>x.n===n);return `<div class="tile"><div class="hd"><span class="pulse"></span><b>#${n}</b> ${t.title}<span class="r">${tier(t.tier)}</span></div>${logDiv(n,8)}</div>`;}).join('')}
+    </div>
+    <div class="drawer" id="drawer"><header>Planner · Claude Opus<button data-drawer>✕</button></header>
+      <div class="msgs">${CHAT.map(([w,s])=>`<div class="m ${w}">${s}</div>`).join('')}</div>
+      <div style="margin:14px;border:1px solid #ffffff22;border-radius:12px;padding:12px;color:#818cf8">Ask the Planner…</div></div>
+  </div>`;
+}
+
+/* =========================================================
+   C · Conversation-first
+   ========================================================= */
+function C(){
+  const tot = spent();
+  const who = (me, name, time) => `<div class="who"><span class="av ${me?'me':''}">${me?'C':'P'}</span>${name}<span style="font-weight:400;color:#a8a29e">${time}</span></div>`;
+  const tk = (n, body, act) => {const t=T.find(x=>x.n===n);return `<div class="tk light"><div class="top"><span class="n">#${n}</span><span class="t">${t.title}</span>${tier(t.tier)}</div>${body||''}${act||''}</div>`;};
+  return `<div class="C">
+    <nav><div class="brand">Orchestrator</div>
+      <a class="on">Recipe app v2 <small>9</small></a><a>Billing cleanup <small>4</small></a><a>Docs site <small>✓</small></a>
+      <div style="margin-top:auto;font-size:12px;color:#a8a29e;padding:0 8px">acme/recipe-app</div></nav>
+    <div class="thread">
+      ${CHAT.slice(0,3).map(([w,s],i)=>`<div>${who(w==='u',w==='u'?'You':'Planner',['1:52 pm','1:52 pm','1:55 pm'][i])}<div class="txt">${s}</div></div>`).join('')}
+      <div>${who(false,'Planner','2:03 pm')}<div class="txt" style="margin-bottom:12px">Here's the plan — 9 Tickets, about ${money(T.reduce((a,t)=>a+t.est,0))} beyond your subscriptions.</div>
+        <ul class="plan">${T.map(t=>`<li><span style="color:#a8a29e">#${t.n}</span>${t.title}${t.blockedBy?` <small style="color:#a8a29e">after #${t.blockedBy}</small>`:''}<span class="e">${tier(t.tier)}</span></li>`).join('')}</ul></div>
+      <div class="sys">You approved the plan · 2:14 pm</div>
+      <div>${who(false,'Planner','2:31 pm')}<div class="txt" style="margin-bottom:12px">Pagination fix is done and checks pass. Ready for you.</div>
+        ${tk(14,'',`<div class="act">PR #43 · +4 −2 · 1 file<button class="alt">View diff</button><button class="go">Merge</button></div>`)}</div>
+      <div>${who(false,'Planner','2:40 pm')}<div class="txt" style="margin-bottom:12px">CSV export failed on Codex mini (quoting edge case), so I moved it up to Sonnet. Three Agents are working now:</div>
+        <div style="display:flex;flex-direction:column;gap:10px">${[16,12,17].map(n=>tk(n,logDiv(n,6),'')).join('')}</div></div>
+      <div>${who(false,'Planner','2:58 pm')}<div class="txt" style="margin-bottom:12px"><b>The tag migration failed even on Opus</b> — the 10k-tag test times out. I think it needs an index the Ticket didn't mention. Want me to re-plan it as two Tickets?</div>
+        ${tk(19,'',`<div class="act">2 attempts · ${money(1.12)} spent<button class="alt">I'll take it</button><button class="go">Re-plan</button></div>`)}</div>
+    </div>
+    <div class="composer">Reply to the Planner…</div>
+    <aside>
+      <h5>Spent so far</h5><div class="dollars tabnum" data-spent>${money(tot)}</div>
+      <div class="row"><span>Still to go (est.)</span><span>${money(remaining())}</span></div>
+      <div class="row" style="color:#15803d"><span>Saved vs. all-Opus</span><span>${money(allFrontier()-tot)}</span></div>
+      <h5>Subscriptions</h5>${QUOTA.map(q=>`<div class="row"><span>${q.name}</span><span>${q.pct}%</span></div><div class="bar"><i style="width:${q.pct}%"></i></div>`).join('')}
+      <h5>Progress</h5>${['merged','review','running','stuck','queued'].map(s=>`<div class="row"><span>${STATES[s]}</span><span>${byState(s).length}</span></div>`).join('')}
+    </aside>
+  </div>`;
+}
+
+/* =========================================================
+   D · Checkpoint Inbox
+   ========================================================= */
+function D(){
+  const tot = spent(), sbt = spentByTier(), grand = tot + remaining();
+  const groups = [['Needs you', t=>t.state==='review'||t.state==='stuck'],['Running', t=>t.state==='running'],['Up next', t=>t.state==='queued'],['Done', t=>t.state==='merged']];
+  const sel = T.find(t=>t.n===selected);
+  return `<div class="D light">
+    <nav><div class="brand"><b></b>Orchestrator</div>
+      <a class="on">Inbox <span class="badge">3</span></a><a>All Tickets</a><a>Plan</a><a>Cost</a><a>History</a>
+      <div style="margin:22px 10px 8px;font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em">Target Repos</div>
+      <a>acme/recipe-app</a><a>acme/docs</a></nav>
+    <div class="center">
+      <div class="costbar">
+        <div><div class="k">Spent</div><div class="v tabnum" data-spent>${money(tot)}</div></div>
+        <div><div class="k">Est. total</div><div class="v tabnum">${money(grand)}</div></div>
+        <div class="seg"><div class="s">${sbt.map((v,i)=>`<i style="width:${v/grand*100}%;background:${TIERS[i+1].c}"></i>`).join('')}<i style="width:${PLANNER/grand*100}%;background:#c4b5fd"></i></div>
+          <div class="lg">${[1,2,3,4].map(i=>`<span><i style="background:${TIERS[i].c}"></i>${TIERS[i].short}</span>`).join('')}<span><i style="background:#c4b5fd"></i>Planner</span><span style="margin-left:auto">${QUOTA.map(q=>`${q.name.split(' ·')[0]} ${q.pct}%`).join(' · ')}</span></div></div>
+      </div>
+      <div class="list">${groups.map(([g,f])=>{const items=T.filter(f);return `<div class="grp">${g}<span>${items.length}</span></div>${items.map(t=>`
+        <div class="r ${t.n===selected?'sel':''}" data-sel="${t.n}"><span class="n">#${t.n}</span><span>${t.title}</span>${tier(t.tier)}
+          <span class="st"><span class="dot" style="background:${SC[t.state]}"></span>${STATES[t.state]}</span>
+          <span class="c tabnum">${t.spent?money(t.spent):'—'}</span>
+          <span>${t.state==='review'?'<button class="btn">Merge</button>':t.state==='stuck'?'<button class="btn" style="background:#ef4444">Act</button>':''}</span></div>`).join('')}`;}).join('')}</div>
+    </div>
+    <div class="detail">
+      <div><div style="color:#94a3b8;font-size:12.5px">#${sel.n} · ${STATES[sel.state]}</div><h2>${sel.title}</h2></div>
+      ${sel.why?`<div style="background:#fef2f2;color:#991b1b;border-radius:10px;padding:10px 12px;font-size:13px">${sel.why}</div>`:''}
+      <div class="hist">${sel.hist.length?sel.hist.map((h,i)=>`<div style="--c:${TIERS[h].c}">${tier(h)}<span>${i<sel.hist.length-1||sel.state==='stuck'?'failed':sel.state==='running'?'running now':sel.state==='review'?'passed · PR #'+sel.pr:'merged'}</span></div>`).join(''):`<div>Routed to ${tier(sel.tier)} — not started${sel.blockedBy?` (waits on #${sel.blockedBy})`:''}</div>`}</div>
+      <div class="term">${SCRIPTS[sel.n]?logDiv(sel.n,20):'<div style="color:#64748b;font-size:12px" class="mono">No live output.</div>'}</div>
+    </div>
+  </div>`;
+}
+
+/* ---------------- variant switching ---------------- */
+const V = {A:['Mission control',A], B:['Tier ladder',B], C:['Conversation-first',C], D:['Checkpoint inbox',D]};
+const keys = Object.keys(V);
+let variant = (new URLSearchParams(location.search).get('variant')||'A').toUpperCase();
+if (!V[variant]) variant = 'A';
+
+function render(){
+  $('#app').innerHTML = V[variant][1]();
+  $('#label').innerHTML = `${variant} <small>(${V[variant][0]})</small> &nbsp;<small>${keys.indexOf(variant)+1}/${keys.length}</small>`;
+  document.title = `PROTOTYPE · ${variant} ${V[variant][0]}`;
+  renderLogs();
+}
+function go(d){
+  variant = keys[(keys.indexOf(variant)+d+keys.length)%keys.length];
+  try { history.replaceState(null,'','?variant='+variant); } catch { location.search = '?variant='+variant; return; }
+  render();
+}
+$('#prev').onclick = () => go(-1);
+$('#next').onclick = () => go(1);
+addEventListener('keydown', e => {
+  if (e.target.closest('input,textarea,[contenteditable]')) return;
+  if (e.key==='ArrowLeft') go(-1);
+  if (e.key==='ArrowRight') go(1);
+  if (e.key==='k' && (e.metaKey||e.ctrlKey)) { e.preventDefault(); $('#drawer')?.classList.toggle('open'); }
+});
+document.addEventListener('click', e => {
+  const s = e.target.closest('[data-sel]'); if (s && !e.target.closest('button')) { selected = +s.dataset.sel; render(); }
+  if (e.target.closest('[data-drawer]')) $('#drawer')?.classList.toggle('open');
+});
+
+/* ---------------- fake live output ---------------- */
+function renderLogs(){
+  document.querySelectorAll('[data-log]').forEach(el => {
+    const n = el.dataset.log, lines = +el.dataset.lines;
+    const html = logs[n].slice(-lines).map(fmt).join('');
+    if (el.dataset.html === html) return;
+    el.dataset.html = html; el.innerHTML = html;
+    el.lastElementChild?.classList.add('new');
+  });
+}
+setInterval(() => {
+  for (const k of [12,16,17]) {
+    if (Math.random() < .45) continue;
+    const s = SCRIPTS[k]; logs[k].push(s[cur[k] % s.length]); cur[k]++;
+    const t = T.find(x=>x.n===k); if (t.tier>1) t.spent += .003;
+  }
+  renderLogs();
+  document.querySelectorAll('[data-spent]').forEach(el => { const node = el.firstChild; if (node && node.nodeType===3) node.textContent = money(spent()) + (el.children.length?' ':''); });
+}, 900);
+
+render();
+</script>
+</body>
+</html>
