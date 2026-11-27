@@ -37,7 +37,18 @@ One unit of build work on the Target Repo, recorded as a GitHub issue: sized so 
 Choosing the Model Tier that first works a Ticket. The Planner names it for each Ticket from the Ladder, picking the cheapest it judges capable. When that Agent is near its quota limit, the Orchestrator moves the Ticket to the next more capable Model Tier of another Agent, and pauses if every Agent is near its limit.
 
 **Escalation**
-Retrying a Ticket from scratch on the next more capable Model Tier on the Ladder after a cheaper one fails it. When the most capable Model Tier fails, the Ticket stops and is handed to the user.
+Starting a new Run of a Ticket, from scratch, on the next more capable Model Tier on the Ladder after a Run on a cheaper one fails. When the most capable Model Tier fails, the Ticket stops in a Handback.
 
 **Checkpoint**
 A point where the Orchestrator stops for the user: approving the plan, and merging a Ticket's pull request. Everything between Checkpoints runs unattended.
+
+**Run**
+One unattended Agent run on one Ticket at one Model Tier. A Ticket has one or more Runs: Escalation, Refresh, and redoing a Run cut short when the Orchestrator itself stopped each start a new one from a freshly reset worktree (the last at the same Model Tier, not counted as a failure), while a Run asked for at the merge Checkpoint continues the existing work with the user's feedback.
+_Avoid_: attempt, job
+
+**Refresh**
+A new Run of a Ticket at the same Model Tier, started because the default branch moved under its open pull request and a plain rebase conflicts. It is not an Escalation: the Ticket did not fail, so no Model Tier is used up.
+
+**Handback**
+An unplanned stop where the Orchestrator gives one Ticket back to the user because it cannot finish it unattended: the most capable Model Tier failed it or judged it unclear or impossible, its pull request was closed without merging, Refreshes kept conflicting, its checks never finished, a Run the user asked for at the merge Checkpoint failed, or the user stopped its Run. The user retries it at a Model Tier of their choice, re-plans it through the Planner, or takes it over. Unlike a Checkpoint, it is never part of the plan.
+_Avoid_: Checkpoint (those are the two planned stops)
