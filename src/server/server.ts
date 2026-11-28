@@ -2,7 +2,7 @@
 // `app.request`; the real process will serve the same app on 127.0.0.1.
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { streamSSE } from 'hono/streaming';
 import type { z } from 'zod';
 import {
@@ -24,6 +24,7 @@ import { resolveDataFolder } from './data-folder.ts';
 import { Engine, NotFound, Refused } from './engine.ts';
 import { GhNotLoggedIn, type GhAuth } from './gh-auth.ts';
 import type { GitHub } from './github.ts';
+import { isJson, localGuard, NotJson } from './local-guard.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
 import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
 import { Store } from './store.ts';
@@ -37,6 +38,8 @@ export type ServerDeps = {
   notifier?: Notifier;
   log?: (message: string, error?: unknown) => void;
   webRoot?: string; // the built web UI, served at /; none in API-only tests
+  port?: number; // the port it listens on; none for in-process requests to http://localhost/
+  devOrigins?: string[]; // the Vite dev server's origins under `npm run dev`
 };
 
 export type Server = {
@@ -84,11 +87,16 @@ export function createServer(deps: ServerDeps): Server {
 
   const app = new Hono();
 
-  async function parseBody<S extends z.ZodType>(body: Promise<unknown>, schema: S) {
-    return schema.safeParse(await body.catch(() => undefined));
+  app.use('*', localGuard({ port: deps.port, devOrigins: deps.devOrigins }));
+
+  // Only a JSON body: a cross-site page can send text/plain without a preflight.
+  async function parseBody<S extends z.ZodType>(c: Context, schema: S) {
+    if (!isJson(c.req.header('content-type'))) throw new NotJson();
+    return schema.safeParse(await c.req.json().catch(() => undefined));
   }
 
   app.onError((error, c) => {
+    if (error instanceof NotJson) return c.json({ error: error.message }, 415);
     if (error instanceof PlanNotFound || error instanceof NotFound) return c.json({ error: error.message }, 404);
     if (error instanceof PlanBusy || error instanceof Refused) return c.json({ error: error.message }, 409);
     return c.json({ error: error.message }, 500);
@@ -97,7 +105,7 @@ export function createServer(deps: ServerDeps): Server {
   app.get('/api/repos', (c) => c.json(engine.targetRepos()));
 
   app.post('/api/repos', async (c) => {
-    const req = await parseBody(c.req.json(), addTargetRepoRequestSchema);
+    const req = await parseBody(c, addTargetRepoRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await engine.addTargetRepo(req.data.owner, req.data.name), 201);
   });
@@ -108,13 +116,13 @@ export function createServer(deps: ServerDeps): Server {
   });
 
   app.post('/api/tickets', async (c) => {
-    const req = await parseBody(c.req.json(), registerTicketRequestSchema);
+    const req = await parseBody(c, registerTicketRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await engine.registerTicket(req.data), 201);
   });
 
   app.post('/api/approved-plans', async (c) => {
-    const req = await parseBody(c.req.json(), registerApprovedPlanRequestSchema);
+    const req = await parseBody(c, registerApprovedPlanRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await engine.registerApprovedPlan(req.data), 201);
   });
@@ -122,7 +130,7 @@ export function createServer(deps: ServerDeps): Server {
   app.get('/api/settings/parallel-limits', (c) => c.json(engine.parallelLimits()));
 
   app.patch('/api/settings/parallel-limits', async (c) => {
-    const req = await parseBody(c.req.json(), updateParallelLimitsRequestSchema);
+    const req = await parseBody(c, updateParallelLimitsRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(engine.updateParallelLimits(req.data));
   });
@@ -146,7 +154,7 @@ export function createServer(deps: ServerDeps): Server {
 
   // Changes only the settings the body names.
   app.put('/api/settings', async (c) => {
-    const req = await parseBody(c.req.json(), updateSettingsRequestSchema);
+    const req = await parseBody(c, updateSettingsRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     const { plannerTier, ...escalation } = req.data;
     if (plannerTier) planner.setPlannerTier(plannerTier);
@@ -155,7 +163,7 @@ export function createServer(deps: ServerDeps): Server {
   });
 
   app.post('/api/plans', async (c) => {
-    const req = await parseBody(c.req.json(), startPlanRequestSchema);
+    const req = await parseBody(c, startPlanRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await planner.start(req.data), 201);
   });
@@ -165,13 +173,13 @@ export function createServer(deps: ServerDeps): Server {
   app.get('/api/plans/:id', (c) => c.json(planner.plan(Number(c.req.param('id')))));
 
   app.patch('/api/plans/:id/draft', async (c) => {
-    const req = await parseBody(c.req.json(), editPlanDraftRequestSchema);
+    const req = await parseBody(c, editPlanDraftRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(planner.editDraft(Number(c.req.param('id')), req.data));
   });
 
   app.post('/api/plans/:id/messages', async (c) => {
-    const req = await parseBody(c.req.json(), replyToPlanRequestSchema);
+    const req = await parseBody(c, replyToPlanRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await planner.reply(Number(c.req.param('id')), req.data));
   });
