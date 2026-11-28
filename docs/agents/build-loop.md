@@ -40,7 +40,7 @@ The narrow bar is the user's decision (2026-11-28): reviewers kept finding fresh
 
 ### 4. Land each reviewed PR
 
-- **Changes needed, or tests red**: send the findings to the worker that wrote the code, then run a **new** reviewer on the result. After two rounds of changes needed, unassign the ticket, comment what went wrong, add `needs-info`, and leave it for the user.
+- **Changes needed, or tests red**: send the findings to the worker that wrote the code, then run a **new** reviewer on the result. After two rounds of changes needed, don't hand the ticket back: decide the remaining blockers yourself from the Spec and the decided behaviour, send them to the worker, and keep reviewing until it lands. Add `needs-info` only for a question that genuinely needs the user (a product decision the Spec doesn't settle), ask it, and carry on with other tickets meanwhile.
 - **Approved, two-way**: the door is two-way only when both the worker and the reviewer call it two-way. Merge with `gh pr merge <pr> --squash --delete-branch` once CI (if any) is green. If `main` moved since the review, have the worker rebase and rerun the tests first; a rebase with real conflict resolution gets a fresh reviewer. The issue closes through `Closes #<n>`.
 - **Approved, one-way** (either call says one-way, or a call is missing): leave the PR open, comment "One-way door: waiting for the user to merge", and move on. Its dependents stay blocked until the user merges it.
 
