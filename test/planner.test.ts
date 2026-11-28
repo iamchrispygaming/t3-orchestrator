@@ -100,8 +100,88 @@ describe('the Planner interview', () => {
     expect(seenReadme).toBe('# Target Repo');
     expect(git(agent.calls[0]!.cwd, 'rev-parse', 'HEAD')).toBe(git(remote, 'rev-parse', 'main'));
   });
-});
 
-void existsSync;
-void drafted;
-void draft;
+  it('resumes the same session for each answer, numbers the next round, and pushes the updated draft over SSE', async () => {
+    agent
+      .script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }], { sessionId: 'planner-1' }))
+      .script('plan', () => round([{ question: 'Link it from the README?', recommended: 'Yes.' }], { sessionId: 'planner-1', draft }))
+      .script('plan', () => drafted(draft, { sessionId: 'planner-1' }));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+
+    await api.replyToPlan(plan.id, { text: 'Yes.' });
+    const second = await settled(events, plan.id);
+    expect(second.status).toBe('asking');
+    expect(second.draft).toEqual(draft);
+    expect(second.messages.at(-1)).toMatchObject({ from: 'planner', round: { number: 2 } });
+
+    await api.replyToPlan(plan.id, { text: 'Yes, link it.' });
+    const done = await settled(events, plan.id);
+    await events.close();
+
+    expect(done.status).toBe('drafted');
+    expect(done.draft).toEqual(draft);
+    expect(done.messages.map((m) => m.from)).toEqual(['user', 'planner', 'user', 'planner', 'user', 'planner']);
+    expect(done.messages.filter((m) => m.from === 'user').map((m) => m.text)).toEqual(['Greet people.', 'Yes.', 'Yes, link it.']);
+    expect(agent.calls.map((c) => c.resumeSessionId)).toEqual([undefined, 'planner-1', 'planner-1']);
+    expect(agent.calls[2]!.instructions).toContain('Yes, link it.');
+    expect(await api.getPlan(plan.id)).toEqual(done);
+  });
+
+  it('refuses a reply while the Planner is still thinking', async () => {
+    let finish!: () => void;
+    agent.script('plan', () => new Promise((resolve) => (finish = () => resolve(round([{ question: 'Q?', recommended: 'A.' }])))));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+
+    await expect(api.replyToPlan(plan.id, { text: 'Hurry up.' })).rejects.toThrow(/409/);
+    finish();
+    await settled(events, plan.id);
+    await events.close();
+  });
+
+  it('"just draft it" skips the remaining questions and yields a draft', async () => {
+    agent
+      .script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }]))
+      .script('plan', () => drafted(draft));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+
+    await api.replyToPlan(plan.id, { justDraft: true, text: 'Keep it small.' });
+    const done = await settled(events, plan.id);
+    await events.close();
+
+    expect(done.status).toBe('drafted');
+    expect(done.draft).toEqual(draft);
+    expect(done.messages.at(-2)).toMatchObject({ from: 'user', text: 'Keep it small.', justDraft: true });
+    expect(done.messages.at(-1)).toMatchObject({ from: 'planner', round: null });
+    expect(agent.calls[1]!.instructions).toContain('Keep it small.');
+    expect(agent.calls[1]!.instructions).toMatch(/just draft it.*ask no more questions/is);
+  });
+
+  it('"just draft it" never opens another round: a Planner that asks anyway fails the turn', async () => {
+    agent
+      .script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }]))
+      .script('plan', () => round([{ question: 'One more?', recommended: 'No.' }], { draft }));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+
+    await api.replyToPlan(plan.id, { justDraft: true });
+    const after = await settled(events, plan.id);
+    await events.close();
+
+    expect(after.status).toBe('failed');
+    expect(after.messages.filter((m) => m.from === 'planner' && m.round)).toHaveLength(1);
+  });
+});
