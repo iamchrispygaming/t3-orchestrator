@@ -1,17 +1,36 @@
 // The engine: the Ticket state machine. It talks to the outside only through
 // the AgentRunner and GitHub ports, the store and the repo workspace.
 //
-// This is the tracer-bullet path only: Ready -> Running -> Reviewing -> Merged.
-// Every other branch of the state machine stops with NotYetHandled until the
-// ticket that builds it lands (Escalation #26, Review #27, doors #28, ...).
+// Waiting -> Ready when every blocker is Merged; Ready -> Running when the
+// Ticket's Agent has a free slot, in queue order; then the tracer-bullet path
+// Running -> Reviewing -> Merged. Every other branch of the state machine stops
+// with NotYetHandled until the ticket that builds it lands (Escalation #26, Review #27, doors #28, ...).
 import { z } from 'zod';
-import type { Door, ModelTier, RegisterTicketRequest, TargetRepo, Ticket, TicketState } from '../shared/api.ts';
-import { reviewOutcomeSchema, runOutcomeSchema, type AgentRunner, type RunMode } from './agent-runner.ts';
+import type {
+  Agent,
+  Door,
+  ModelTier,
+  ApprovedPlan,
+  ParallelLimits,
+  RegisterApprovedPlanRequest,
+  RegisterTicketRequest,
+  TargetRepo,
+  Ticket,
+  TicketState,
+  UpdateParallelLimitsRequest,
+} from '../shared/api.ts';
+import {
+  reviewOutcomeSchema,
+  runOutcomeSchema,
+  type AgentRunner,
+  type RunMode,
+  type RunOutcome,
+} from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import type { GitHub } from './github.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
-import { RepoWorkspace } from './workspace.ts';
+import { RepoWorkspace, type TicketFolders } from './workspace.ts';
 
 export const RUN_TIME_LIMIT_MS = 60 * 60_000;
 
@@ -53,6 +72,9 @@ export class Engine {
   private listeners = new Set<(ticket: Ticket) => void>();
   private inFlight = new Set<Promise<void>>();
   private stopping = new AbortController();
+  // Agent executions in progress: a slot is held from the Run's start until the
+  // Agent returns, not while the Orchestrator pushes, opens the PR and waits on CI.
+  private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
   private deps: EngineDeps;
 
   constructor(deps: EngineDeps) {
@@ -74,23 +96,63 @@ export class Engine {
     return this.deps.store.addTargetRepo({ owner, name, defaultBranch: info.defaultBranch });
   }
 
-  async registerTicket(req: RegisterTicketRequest): Promise<Ticket> {
-    const repo = this.deps.store.getTargetRepo(req.repoId);
+  async registerTicket({ repoId, ...ticket }: RegisterTicketRequest): Promise<Ticket> {
+    const plan = await this.registerApprovedPlan({ repoId, tickets: [ticket] });
+    return plan.tickets[0]!;
+  }
+
+  // Registers an approved Plan: each Ticket waits on its open blockers, and the
+  // Tickets queue in the order given.
+  async registerApprovedPlan(req: RegisterApprovedPlanRequest): Promise<ApprovedPlan> {
+    const { store, github, clock } = this.deps;
+    const repo = store.getTargetRepo(req.repoId);
     if (!repo) throw new Error(`no Target Repo ${req.repoId}`);
-    const issue = await this.deps.github.getIssue(repo.owner, repo.name, req.issueNumber);
-    const ticket = this.deps.store.addTicket({
-      repoId: repo.id,
-      issueNumber: issue.number,
-      title: issue.title,
-      body: issue.body,
-      branch: branchName(issue.number, issue.title),
-      tier: req.tier,
-      door: req.door,
-      state: 'ready',
+    const entries = await Promise.all(
+      req.tickets.map(async (entry) => ({
+        entry,
+        issue: await github.getIssue(repo.owner, repo.name, entry.issueNumber),
+        // A blocker a merged PR already closed is done. Any other blocker holds the
+        // Ticket until a merge closes it or the Orchestrator's own Ticket for it is Merged.
+        blockers: await github.getBlockers(repo.owner, repo.name, entry.issueNumber),
+      })),
+    );
+
+    const { plan, ids } = store.transaction(() => {
+      const plan = store.addApprovedPlan(repo.id, clock.now());
+      const ids = entries.map(({ entry, issue, blockers }, position) =>
+        store.addTicket({
+          repoId: repo.id,
+          issueNumber: issue.number,
+          title: issue.title,
+          body: issue.body,
+          branch: branchName(issue.number, issue.title),
+          tier: entry.tier,
+          door: entry.door,
+          state: 'waiting',
+          planId: plan.id,
+          planPosition: position,
+          blockers,
+        }).id,
+      );
+      // Only once every Ticket of the Plan exists can blockers inside it be resolved.
+      for (const id of ids) if (store.unmetBlockers(id) === 0) store.updateTicket(id, { state: 'ready' });
+      return { plan, ids };
     });
-    this.emit(ticket.id);
-    this.track(this.work(ticket.id));
-    return publicTicket(ticket);
+
+    const tickets = ids.map((id) => publicTicket(store.getTicket(id)!));
+    for (const id of ids) this.emit(id);
+    this.schedule();
+    return { ...plan, tickets };
+  }
+
+  parallelLimits(): ParallelLimits {
+    return this.deps.store.parallelLimits();
+  }
+
+  updateParallelLimits(change: UpdateParallelLimitsRequest): ParallelLimits {
+    const limits = this.deps.store.updateParallelLimits(change);
+    this.schedule(); // a raised limit frees slots
+    return limits;
   }
 
   // Stops in-flight Runs and waits for them to wind down.
@@ -115,17 +177,62 @@ export class Engine {
     for (const listener of this.listeners) listener(ticket);
   }
 
+  // Starts Ready Tickets in queue order while their Agent has a free slot.
+  // Synchronous, so two calls can never hand out the same slot.
+  private schedule(): void {
+    if (this.stopping.signal.aborted) return;
+    const { store } = this.deps;
+    const limits = store.parallelLimits();
+    for (const ticket of store.readyQueue()) {
+      const agent = ticket.tier.agent;
+      if (this.slotsInUse[agent] >= limits[agent]) continue;
+      this.slotsInUse[agent]++;
+      this.setState(ticket.id, 'running');
+      this.track(this.work(ticket.id));
+    }
+  }
+
+  private freeSlot(agent: Agent): void {
+    this.slotsInUse[agent]--;
+    this.schedule();
+  }
+
+  // A merge may unblock Waiting Tickets, in any Target Repo, through the Ticket
+  // itself or through every other issue its PR closed. Re-read each Waiting
+  // Ticket's blockers from GitHub, the same evidence registration uses.
+  private async merged(ticket: StoredTicket): Promise<void> {
+    const { store, github } = this.deps;
+    this.setState(ticket.id, 'merged');
+    for (const waiting of store.waitingTickets()) {
+      try {
+        const repo = store.getTargetRepo(waiting.repoId)!;
+        store.recordBlockers(waiting.id, await github.getBlockers(repo.owner, repo.name, waiting.issueNumber));
+      } catch (error) {
+        this.deps.log(`Could not re-read the blockers of Ticket ${waiting.id}`, error);
+      }
+      if (store.getTicket(waiting.id)!.state === 'waiting' && store.unmetBlockers(waiting.id) === 0) {
+        this.setState(waiting.id, 'ready');
+      }
+    }
+    this.schedule();
+  }
+
   private async work(id: number): Promise<void> {
     const { store, github, clock } = this.deps;
     const ticket = store.getTicket(id)!;
     const repo = store.getTargetRepo(ticket.repoId)!;
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
 
-    this.setState(id, 'running');
-    const folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
-    const runId = store.startRun(id, ticket.tier, clock.now());
-    const run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
-    store.endRun(runId, clock.now(), run.status, run.reason);
+    let folders: TicketFolders;
+    let run: RunOutcome;
+    try {
+      folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
+      const runId = store.startRun(id, ticket.tier, clock.now());
+      run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
+      store.endRun(runId, clock.now(), run.status, run.reason);
+    } finally {
+      this.freeSlot(ticket.tier.agent);
+    }
     if (run.status !== 'done') throw new NotYetHandled(`Run ended ${run.status}: ${run.reason}`);
     if ((await workspace.commitsAhead(ticket.branch, repo.defaultBranch)) === 0) {
       throw new NotYetHandled('Run made no commits');
@@ -152,7 +259,7 @@ export class Engine {
 
     if (mostCautious(ticket.door, run.door, review.door) !== 'two-way') throw new NotYetHandled('One-way Ticket');
     await github.mergePullRequest(repo.owner, repo.name, pr.number, 'squash');
-    this.setState(id, 'merged');
+    await this.merged(ticket);
   }
 
   private async runAgent<S extends z.ZodType>(

@@ -17,6 +17,20 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 
 export type TicketFolders = { worktree: string; scratch: string };
 
+// Git operations on one bare clone run one at a time: Tickets of the same Target
+// Repo start in parallel, and concurrent fetches or worktree adds race on git's locks.
+const queues = new Map<string, Promise<unknown>>();
+
+function serially<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const result = (queues.get(key) ?? Promise.resolve()).catch(() => undefined).then(work);
+  const tail = result.catch(() => undefined);
+  queues.set(key, tail);
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return result;
+}
+
 export class RepoWorkspace {
   readonly root: string;
   private readonly gitDir: string;
@@ -36,13 +50,15 @@ export class RepoWorkspace {
   }
 
   // A fresh worktree for the Ticket on `branch`, reset to the latest default branch.
-  async prepareTicket(issueNumber: number, branch: string, defaultBranch: string): Promise<TicketFolders> {
-    const worktree = join(this.root, 'work', String(issueNumber));
-    const scratch = join(this.root, 'scratch', String(issueNumber));
-    await git(this.gitDir, 'fetch', '--prune', 'origin');
-    await git(this.gitDir, 'worktree', 'add', '-B', branch, worktree, `origin/${defaultBranch}`);
-    await mkdir(scratch, { recursive: true });
-    return { worktree, scratch };
+  prepareTicket(issueNumber: number, branch: string, defaultBranch: string): Promise<TicketFolders> {
+    return serially(this.gitDir, async () => {
+      const worktree = join(this.root, 'work', String(issueNumber));
+      const scratch = join(this.root, 'scratch', String(issueNumber));
+      await git(this.gitDir, 'fetch', '--prune', 'origin');
+      await git(this.gitDir, 'worktree', 'add', '-B', branch, worktree, `origin/${defaultBranch}`);
+      await mkdir(scratch, { recursive: true });
+      return { worktree, scratch };
+    });
   }
 
   async commitsAhead(branch: string, defaultBranch: string): Promise<number> {
@@ -70,7 +86,9 @@ export class RepoWorkspace {
   }
 
   // Only the Orchestrator pushes; Agents just commit in their worktree.
-  async push(branch: string): Promise<void> {
-    await git(this.gitDir, 'push', '--force', 'origin', `refs/heads/${branch}:refs/heads/${branch}`);
+  push(branch: string): Promise<void> {
+    return serially(this.gitDir, async () => {
+      await git(this.gitDir, 'push', '--force', 'origin', `refs/heads/${branch}:refs/heads/${branch}`);
+    });
   }
 }

@@ -1,8 +1,10 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
+import type { Blocker } from './github.ts';
 import type {
   Door,
   ModelTier,
+  ParallelLimits,
   PlanDraft,
   PlanMessage,
   PlanStatus,
@@ -75,7 +77,32 @@ const migrations: string[] = [
      key TEXT PRIMARY KEY,
      value TEXT NOT NULL
    );`,
+  `CREATE TABLE approved_plans (
+     id INTEGER PRIMARY KEY,
+     repo_id INTEGER NOT NULL REFERENCES target_repos(id),
+     approved_at TEXT NOT NULL
+   );
+   ALTER TABLE tickets ADD COLUMN plan_id INTEGER REFERENCES approved_plans(id);
+   ALTER TABLE tickets ADD COLUMN plan_position INTEGER NOT NULL DEFAULT 0;
+   CREATE TABLE ticket_blockers (
+     ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+     owner TEXT NOT NULL COLLATE NOCASE, -- the blocker's repository: dependencies can cross repos
+     name TEXT NOT NULL COLLATE NOCASE,
+     issue_number INTEGER NOT NULL,
+     merged INTEGER NOT NULL DEFAULT 0, -- GitHub showed a merged PR closing it
+     PRIMARY KEY (ticket_id, owner, name, issue_number)
+   );`,
 ];
+
+export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
+
+export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
+
+export type NewTicket = Omit<StoredTicket, 'id' | 'prNumber'> & {
+  planId: number;
+  planPosition: number;
+  blockers: Blocker[];
+};
 
 type Row = Record<string, unknown>;
 
@@ -131,14 +158,96 @@ export class Store {
     return row && { id: Number(row.id), owner: String(row.owner), name: String(row.name), defaultBranch: String(row.default_branch) };
   }
 
-  addTicket(t: Omit<StoredTicket, 'id' | 'prNumber'>): StoredTicket {
+  transaction<T>(work: () => T): T {
+    this.db.exec('BEGIN');
+    try {
+      const result = work();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  addApprovedPlan(repoId: number, approvedAt: Date): StoredApprovedPlan {
+    const { lastInsertRowid } = this.db
+      .prepare('INSERT INTO approved_plans (repo_id, approved_at) VALUES (?, ?)')
+      .run(repoId, approvedAt.toISOString());
+    return { id: Number(lastInsertRowid), repoId, approvedAt: approvedAt.toISOString() };
+  }
+
+  addTicket(t: NewTicket): StoredTicket {
     const { lastInsertRowid } = this.db
       .prepare(
-        `INSERT INTO tickets (repo_id, issue_number, title, body, branch, tier, door, state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tickets (repo_id, issue_number, title, body, branch, tier, door, state, plan_id, plan_position)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(t.repoId, t.issueNumber, t.title, t.body, t.branch, JSON.stringify(t.tier), t.door, t.state);
-    return this.getTicket(Number(lastInsertRowid))!;
+      .run(
+        t.repoId,
+        t.issueNumber,
+        t.title,
+        t.body,
+        t.branch,
+        JSON.stringify(t.tier),
+        t.door,
+        t.state,
+        t.planId,
+        t.planPosition,
+      );
+    const id = Number(lastInsertRowid);
+    this.recordBlockers(id, t.blockers);
+    return this.getTicket(id)!;
+  }
+
+  // Adds blockers and records merge evidence; evidence once seen is never taken back.
+  recordBlockers(ticketId: number, blockers: Blocker[]): void {
+    const record = this.db.prepare(
+      `INSERT INTO ticket_blockers (ticket_id, owner, name, issue_number, merged) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (ticket_id, owner, name, issue_number) DO UPDATE SET merged = MAX(merged, excluded.merged)`,
+    );
+    for (const b of blockers) record.run(ticketId, b.owner, b.name, b.number, b.merged ? 1 : 0);
+  }
+
+  // Blockers not yet merged: no merge evidence from GitHub, and no Merged Ticket
+  // for that issue in that repository.
+  unmetBlockers(ticketId: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM ticket_blockers b
+         WHERE b.ticket_id = ? AND b.merged = 0 AND NOT EXISTS (
+           SELECT 1 FROM tickets blocker JOIN target_repos r ON r.id = blocker.repo_id
+           WHERE r.owner = b.owner AND r.name = b.name
+             AND blocker.issue_number = b.issue_number AND blocker.state = 'merged'
+         )`,
+      )
+      .get(ticketId) as { n: number };
+    return Number(row.n);
+  }
+
+  waitingTickets(): StoredTicket[] {
+    return (this.db.prepare("SELECT * FROM tickets WHERE state = 'waiting' ORDER BY id").all() as Row[]).map(toTicket);
+  }
+
+  // Ready Tickets in queue order: oldest-approved Plan first, then Plan order.
+  readyQueue(): StoredTicket[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.* FROM tickets t LEFT JOIN approved_plans p ON p.id = t.plan_id
+         WHERE t.state = 'ready'
+         ORDER BY p.approved_at, p.id, t.plan_position, t.id`,
+      )
+      .all() as Row[];
+    return rows.map(toTicket);
+  }
+
+  parallelLimits(): ParallelLimits {
+    return { ...defaultParallelLimits, ...(this.getSetting('parallelLimits') as Partial<ParallelLimits> | undefined) };
+  }
+
+  updateParallelLimits(change: Partial<ParallelLimits>): ParallelLimits {
+    this.setSetting('parallelLimits', { ...this.parallelLimits(), ...change });
+    return this.parallelLimits();
   }
 
   getTicket(id: number): StoredTicket | undefined {
