@@ -39,6 +39,16 @@ export type ReviewOutcome = z.infer<typeof reviewOutcomeSchema>;
 
 export type RunEvent =
   | { type: 'text'; text: string }
+  | { type: 'tool'; name: string; detail: string }
+  // A quota reading seen mid-Run, for the quota port. `near-limit` means slow down;
+  // `rejected` means no more quota until `resetsAt`.
+  | {
+      type: 'rate-limit';
+      agent: ModelTier['agent'];
+      status: 'allowed' | 'near-limit' | 'rejected';
+      resetsAt?: string;
+      utilization?: number;
+    }
   | { type: 'result'; result: RunResult };
 
 export type RunMode = 'run' | 'review' | 'plan';
