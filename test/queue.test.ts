@@ -8,7 +8,7 @@ import type { ModelTier, TicketState } from '../src/shared/api.ts';
 import { createApiClient, type ApiClient, type EventStream } from '../src/web/api.ts';
 import { approve, done, FakeAgentRunner } from './support/fake-agent-runner.ts';
 import { FakeClock } from './support/fake-clock.ts';
-import { FakeGitHub } from './support/fake-github.ts';
+import { FakeGitHub, type BlockerSpec } from './support/fake-github.ts';
 import { FakeNotifier } from './support/fake-notifier.ts';
 import { commitFile, createBareRemote } from './support/git.ts';
 
@@ -29,6 +29,7 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
   // Runs the fake Agent has started and not yet finished, by issue number.
   let open: Map<number, Gate>;
   let started: number[];
+  let prBodies: Map<number, string>; // what a Run's PR body says, by issue number
   let seen: { issue: number; state: TicketState }[];
   let waiters: { issue: number; state: TicketState; resolve: () => void }[];
   let issueOf: Map<number, number>; // Ticket id -> issue number
@@ -46,6 +47,7 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
     clock = new FakeClock('2026-01-01T09:00:00.000Z');
     open = new Map();
     started = [];
+    prBodies = new Map();
     seen = [];
     waiters = [];
     issueOf = new Map();
@@ -68,7 +70,7 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
           release: () => {
             open.delete(issue);
             commitFile(req.cwd, `issue-${issue}.txt`, 'done\n', `Work issue ${issue}`);
-            resolve(done());
+            resolve(done(prBodies.has(issue) ? { prBody: prBodies.get(issue)! } : {}));
           },
         });
       });
@@ -148,7 +150,7 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
     }
   }
 
-  function addIssues(repo: string, specs: { number: number; blockedBy?: number[] }[]) {
+  function addIssues(repo: string, specs: { number: number; blockedBy?: BlockerSpec[] }[]) {
     for (const { number, blockedBy } of specs) {
       github.addIssue('acme', repo, { number, title: `Ticket ${number}`, body: `Do ${number}.`, blockedBy });
     }
@@ -182,6 +184,36 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
 
     expect(await stateNow(2)).toBe('waiting');
     expect(started).toEqual([]);
+  });
+
+  it('waits on a blocker in another Target Repo, not on the same issue number in its own', async () => {
+    addIssues('widgets', [{ number: 7 }, { number: 8, blockedBy: [{ owner: 'acme', name: 'gadgets', number: 7 }] }]);
+    addIssues('gadgets', [{ number: 7 }]);
+    const widgets = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const gadgets = await api.addTargetRepo({ owner: 'acme', name: 'gadgets' });
+
+    await approvePlan({ repoId: widgets.id, tickets: [ticket(7), ticket(8)] });
+    await finish(7); // widgets#7
+    expect(await stateNow(8)).toBe('waiting');
+
+    await approvePlan({ repoId: gadgets.id, tickets: [ticket(7)] });
+    await until(() => open.has(7));
+    open.get(7)!.release(); // gadgets#7
+    await reached(8, 'running');
+    expect(github.pulls('acme', 'gadgets')[0]?.merged).toBe(true);
+  });
+
+  it('starts a dependent whose other blocker the same merge closed', async () => {
+    addIssues('widgets', [{ number: 9 }, { number: 10 }, { number: 11, blockedBy: [9, 10] }]);
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    prBodies.set(9, ['## Summary', 'Also does #10.', 'Closes #10'].join('\n\n'));
+
+    await approvePlan({ repoId: repo.id, tickets: [ticket(9), ticket(11)] });
+    expect(await stateNow(11)).toBe('waiting');
+
+    await finish(9);
+    await reached(11, 'running');
+    expect(github.issue('acme', 'widgets', 10)?.state).toBe('closed');
   });
 
   it('does not wait on a blocker that is not a Ticket but was closed by a merged PR', async () => {

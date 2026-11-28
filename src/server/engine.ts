@@ -112,10 +112,8 @@ export class Engine {
         entry,
         issue: await github.getIssue(repo.owner, repo.name, entry.issueNumber),
         // A blocker a merged PR already closed is done. Any other blocker holds the
-        // Ticket until the Orchestrator's own Ticket for it is Merged.
-        blockers: (await github.getBlockers(repo.owner, repo.name, entry.issueNumber))
-          .filter((blocker) => !blocker.merged)
-          .map((blocker) => blocker.number),
+        // Ticket until a merge closes it or the Orchestrator's own Ticket for it is Merged.
+        blockers: await github.getBlockers(repo.owner, repo.name, entry.issueNumber),
       })),
     );
 
@@ -199,11 +197,22 @@ export class Engine {
     this.schedule();
   }
 
-  // A merge may unblock Waiting dependents; they join the queue straight away.
-  private merged(ticket: StoredTicket): void {
+  // A merge may unblock Waiting Tickets, in any Target Repo, through the Ticket
+  // itself or through every other issue its PR closed. Re-read each Waiting
+  // Ticket's blockers from GitHub, the same evidence registration uses.
+  private async merged(ticket: StoredTicket): Promise<void> {
+    const { store, github } = this.deps;
     this.setState(ticket.id, 'merged');
-    for (const dependent of this.deps.store.waitingDependents(ticket.repoId, ticket.issueNumber)) {
-      if (this.deps.store.unmetBlockers(dependent.id) === 0) this.setState(dependent.id, 'ready');
+    for (const waiting of store.waitingTickets()) {
+      try {
+        const repo = store.getTargetRepo(waiting.repoId)!;
+        store.recordBlockers(waiting.id, await github.getBlockers(repo.owner, repo.name, waiting.issueNumber));
+      } catch (error) {
+        this.deps.log(`Could not re-read the blockers of Ticket ${waiting.id}`, error);
+      }
+      if (store.getTicket(waiting.id)!.state === 'waiting' && store.unmetBlockers(waiting.id) === 0) {
+        this.setState(waiting.id, 'ready');
+      }
     }
     this.schedule();
   }
@@ -250,7 +259,7 @@ export class Engine {
 
     if (mostCautious(ticket.door, run.door, review.door) !== 'two-way') throw new NotYetHandled('One-way Ticket');
     await github.mergePullRequest(repo.owner, repo.name, pr.number, 'squash');
-    this.merged(ticket);
+    await this.merged(ticket);
   }
 
   private async runAgent<S extends z.ZodType>(

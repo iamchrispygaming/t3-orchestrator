@@ -8,10 +8,13 @@ export type FakePullRequest = NewPullRequest & {
   mergeMethod: MergeMethod | null;
 };
 
+// A blocking issue: a number in the same repo, or an issue in another repo.
+export type BlockerSpec = number | { owner: string; name: string; number: number };
+
 type FakeRepo = {
   info: RepoInfo;
   issues: Map<number, Issue>;
-  blockedBy: Map<number, number[]>; // native issue dependencies
+  blockedBy: Map<number, BlockerSpec[]>; // native issue dependencies, maybe in another repo
   closedByMerge: Set<number>; // issues a merged PR closed
 
   pulls: FakePullRequest[];
@@ -39,7 +42,7 @@ export class FakeGitHub implements GitHub {
   addIssue(
     owner: string,
     name: string,
-    { blockedBy = [], ...issue }: { number: number; title: string; body: string; blockedBy?: number[] },
+    { blockedBy = [], ...issue }: { number: number; title: string; body: string; blockedBy?: BlockerSpec[] },
   ): void {
     const repo = this.repo(owner, name);
     repo.issues.set(issue.number, { ...issue, state: 'open' });
@@ -94,9 +97,11 @@ export class FakeGitHub implements GitHub {
 
   async getBlockers(owner: string, name: string, number: number): Promise<Blocker[]> {
     const repo = this.repo(owner, name);
-    return (repo.blockedBy.get(number) ?? []).map((n) => {
-      if (!repo.issues.has(n)) throw new Error(`no issue #${n} on ${owner}/${name}`);
-      return { number: n, merged: repo.closedByMerge.has(n) };
+    return (this.repo(owner, name).blockedBy.get(number) ?? []).map((spec) => {
+      const ref = typeof spec === 'number' ? { owner, name, number: spec } : spec;
+      const blockerRepo = this.repo(ref.owner, ref.name);
+      if (!blockerRepo.issues.has(ref.number)) throw new Error(`no issue #${ref.number} on ${ref.owner}/${ref.name}`);
+      return { ...ref, merged: blockerRepo.closedByMerge.has(ref.number) };
     });
   }
 

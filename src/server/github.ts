@@ -3,9 +3,11 @@
 
 export type RepoInfo = { defaultBranch: string; cloneUrl: string };
 export type Issue = { number: number; title: string; body: string; state: 'open' | 'closed' };
+// An issue on GitHub, by repository: native dependencies can cross repositories.
+export type IssueRef = { owner: string; name: string; number: number };
 // A blocking issue. `merged`: a merged pull request closed it. An issue closed
 // by hand does not count: a blocker is done only once its work is merged.
-export type Blocker = { number: number; merged: boolean };
+export type Blocker = IssueRef & { merged: boolean };
 export type NewPullRequest = { head: string; base: string; title: string; body: string };
 export type ChecksState = 'pending' | 'success' | 'failure';
 export type MergeMethod = 'squash';

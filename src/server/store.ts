@@ -1,5 +1,6 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
+import type { Blocker } from './github.ts';
 import type {
   Door,
   ModelTier,
@@ -85,8 +86,11 @@ const migrations: string[] = [
    ALTER TABLE tickets ADD COLUMN plan_position INTEGER NOT NULL DEFAULT 0;
    CREATE TABLE ticket_blockers (
      ticket_id INTEGER NOT NULL REFERENCES tickets(id),
+     owner TEXT NOT NULL COLLATE NOCASE, -- the blocker's repository: dependencies can cross repos
+     name TEXT NOT NULL COLLATE NOCASE,
      issue_number INTEGER NOT NULL,
-     PRIMARY KEY (ticket_id, issue_number)
+     merged INTEGER NOT NULL DEFAULT 0, -- GitHub showed a merged PR closing it
+     PRIMARY KEY (ticket_id, owner, name, issue_number)
    );`,
 ];
 
@@ -97,7 +101,7 @@ export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: strin
 export type NewTicket = Omit<StoredTicket, 'id' | 'prNumber'> & {
   planId: number;
   planPosition: number;
-  blockers: number[]; // issue numbers on the same Target Repo
+  blockers: Blocker[];
 };
 
 type Row = Record<string, unknown>;
@@ -192,33 +196,37 @@ export class Store {
         t.planPosition,
       );
     const id = Number(lastInsertRowid);
-    const addBlocker = this.db.prepare('INSERT OR IGNORE INTO ticket_blockers (ticket_id, issue_number) VALUES (?, ?)');
-    for (const issueNumber of t.blockers) addBlocker.run(id, issueNumber);
+    this.recordBlockers(id, t.blockers);
     return this.getTicket(id)!;
   }
 
-  // Blockers not yet Merged. A blocker the Orchestrator doesn't track counts as unmet.
+  // Adds blockers and records merge evidence; evidence once seen is never taken back.
+  recordBlockers(ticketId: number, blockers: Blocker[]): void {
+    const record = this.db.prepare(
+      `INSERT INTO ticket_blockers (ticket_id, owner, name, issue_number, merged) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (ticket_id, owner, name, issue_number) DO UPDATE SET merged = MAX(merged, excluded.merged)`,
+    );
+    for (const b of blockers) record.run(ticketId, b.owner, b.name, b.number, b.merged ? 1 : 0);
+  }
+
+  // Blockers not yet merged: no merge evidence from GitHub, and no Merged Ticket
+  // for that issue in that repository.
   unmetBlockers(ticketId: number): number {
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM ticket_blockers b
-         JOIN tickets t ON t.id = b.ticket_id
-         LEFT JOIN tickets blocker ON blocker.repo_id = t.repo_id AND blocker.issue_number = b.issue_number
-         WHERE b.ticket_id = ? AND (blocker.state IS NULL OR blocker.state != 'merged')`,
+         WHERE b.ticket_id = ? AND b.merged = 0 AND NOT EXISTS (
+           SELECT 1 FROM tickets blocker JOIN target_repos r ON r.id = blocker.repo_id
+           WHERE r.owner = b.owner AND r.name = b.name
+             AND blocker.issue_number = b.issue_number AND blocker.state = 'merged'
+         )`,
       )
       .get(ticketId) as { n: number };
     return Number(row.n);
   }
 
-  // Waiting Tickets that the given issue blocks.
-  waitingDependents(repoId: number, issueNumber: number): StoredTicket[] {
-    const rows = this.db
-      .prepare(
-        `SELECT t.* FROM tickets t JOIN ticket_blockers b ON b.ticket_id = t.id
-         WHERE t.repo_id = ? AND b.issue_number = ? AND t.state = 'waiting' ORDER BY t.id`,
-      )
-      .all(repoId, issueNumber) as Row[];
-    return rows.map(toTicket);
+  waitingTickets(): StoredTicket[] {
+    return (this.db.prepare("SELECT * FROM tickets WHERE state = 'waiting' ORDER BY id").all() as Row[]).map(toTicket);
   }
 
   // Ready Tickets in queue order: oldest-approved Plan first, then Plan order.
