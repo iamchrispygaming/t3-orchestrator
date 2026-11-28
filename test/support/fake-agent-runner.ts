@@ -11,8 +11,25 @@ import type {
 
 // Endings other than a result: the Agent's quota runs out, or it exits without a result.
 type FakeEnding = { fake: 'quota-hit' } | { fake: 'no-result' };
-type Outcome = RunOutcome | ReviewOutcome | PlanOutcome | FakeEnding;
+type Result = RunOutcome | ReviewOutcome | PlanOutcome;
+// Events the fake Agent streams first, then its result; no result means the stream
+// ends without one, and `thenThrow` makes it crash after the events (a bad exit).
+type Streamed = { events: RunEvent[]; result?: Result; thenThrow?: string };
+type Outcome = Result | FakeEnding | Streamed;
 type Handler = (req: RunRequest) => Promise<Outcome> | Outcome;
+
+export const streaming = (events: RunEvent[], result?: Result, thenThrow?: string): Streamed => ({
+  events,
+  ...(result ? { result } : {}),
+  ...(thenThrow ? { thenThrow } : {}),
+});
+
+// A quota reading, as the adapters report it mid-Run.
+export const rateLimit = (
+  agent: 'claude' | 'codex',
+  status: 'allowed' | 'near-limit' | 'rejected',
+  resetsAt?: Date,
+): RunEvent => ({ type: 'rate-limit', agent, status, ...(resetsAt ? { resetsAt: resetsAt.toISOString() } : {}) });
 
 const noUsage = { inputTokens: 0, outputTokens: 0 };
 
@@ -99,6 +116,12 @@ export class FakeAgentRunner implements AgentRunner {
     try {
       yield { type: 'text', text: `fake ${req.mode} started` };
       const outcome = await script.handler(req);
+      if ('events' in outcome) {
+        yield* outcome.events;
+        if (outcome.result) yield { type: 'result', result: outcome.result };
+        if (outcome.thenThrow) throw new Error(outcome.thenThrow);
+        return;
+      }
       if ('fake' in outcome) {
         if (outcome.fake === 'quota-hit') yield { type: 'rate-limit', agent: req.tier.agent, status: 'rejected' };
         return;

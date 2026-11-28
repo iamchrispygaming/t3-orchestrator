@@ -31,13 +31,16 @@ import {
   type RunEvent,
   type RunMode,
   type RunOutcome,
+  type Usage,
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import { deleteRunLogs } from './data-folder.ts';
 import type { FailedJob, GitHub } from './github.ts';
-import { DEFAULT_ESCALATION_SETTINGS, nextTier, tierLabel } from './ladder.ts';
+import { DEFAULT_ESCALATION_SETTINGS, nextTier, nextTierOf, otherAgent, tierLabel } from './ladder.ts';
 import type { Notifier } from './notifier.ts';
+import { Quota } from './quota.ts';
 import type { Store, StoredTicket } from './store.ts';
+import { priced } from './usage.ts';
 import { BranchMoved, RepoWorkspace, type TicketFolders } from './workspace.ts';
 
 // Live output kept in memory per Ticket; older lines drop off.
@@ -64,13 +67,14 @@ export type EngineDeps = {
 
 type Call = 'one-way' | 'two-way' | 'unclear';
 
-// How the Agent's side of a Run ended.
-type AgentEnd<T> =
+// How the Agent's side of a Run ended, with the usage it reported, if any.
+type AgentEnd<T> = (
   | { kind: 'result'; result: T }
   | { kind: 'crashed'; message: string }
   | { kind: 'timed-out' }
   | { kind: 'quota-hit' }
-  | { kind: 'stopped' }; // the server is stopping
+  | { kind: 'stopped' } // the server is stopping
+) & { usage?: Usage };
 
 // How a whole Run ended, once commits and CI are checked.
 type RunEnd =
@@ -78,6 +82,7 @@ type RunEnd =
   | { kind: 'failed'; outcome: RunOutcomeKind; reason: string }
   | { kind: 'not-a-failure' } // quota hit, Orchestrator or GitHub error: no Model Tier used up
   | { kind: 'handback'; reason: string } // stopped for the user, no Model Tier used up
+  | { kind: 'requeue' } // quota changed before the Agent started: Routing decides again
   | { kind: 'stopped' };
 
 // Any one-way call wins; an unclear call counts as one-way.
@@ -96,7 +101,13 @@ export function branchName(issueNumber: number, title: string): string {
   return `t3o/${issueNumber}-${slug || 'issue'}`;
 }
 
-function publicTicket({ body: _body, publishedHead: _head, ...ticket }: StoredTicket): Ticket {
+function publicTicket({
+  body: _body,
+  publishedHead: _head,
+  pausedFrom: _pausedFrom,
+  quotaHold: _quotaHold,
+  ...ticket
+}: StoredTicket): Ticket {
   return ticket;
 }
 
@@ -136,9 +147,11 @@ export class Engine {
   private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
   private repoLocks = new Map<string, Promise<void>>();
   private deps: EngineDeps;
+  private quota: Quota;
 
   constructor(deps: EngineDeps) {
     this.deps = deps;
+    this.quota = new Quota(deps.store, deps.clock, () => this.quotaFreed());
   }
 
   subscribe(listener: (ticket: Ticket) => void): () => void {
@@ -204,6 +217,19 @@ export class Engine {
       await deleteRunLogs(dataFolder, store.listRunIds(id));
       store.markTargetRepoRemoved(id, clock.now());
     });
+  }
+
+  // The user's override: a Paused Ticket returns to its previous state and its next
+  // Run starts at its own Model Tier whatever the quota readings say.
+  resumeTicket(id: number): Ticket {
+    const { store } = this.deps;
+    const ticket = store.getTicket(id);
+    if (!ticket) throw new NotFound(`no Ticket ${id}`);
+    if (ticket.state !== 'paused') throw new Refused(`Ticket ${id} is not Paused`);
+    store.updateTicket(id, { state: ticket.pausedFrom ?? 'ready', pausedFrom: null, quotaHold: 'override' });
+    this.emit(id);
+    this.schedule();
+    return publicTicket(store.getTicket(id)!);
   }
 
   ticket(id: number): Ticket | undefined {
@@ -296,9 +322,16 @@ export class Engine {
     return this.settings();
   }
 
+  // At startup: arms the quota timers and resumes Tickets whose quota freed while the server was down.
+  start(): void {
+    this.quota.start();
+    this.quotaFreed();
+  }
+
   // Stops in-flight Runs and waits for them to wind down.
   async stop(): Promise<void> {
     this.stopping.abort();
+    this.quota.stop();
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
   }
 
@@ -341,12 +374,42 @@ export class Engine {
     const { store } = this.deps;
     const limits = store.parallelLimits();
     for (const ticket of store.readyQueue()) {
-      const agent = ticket.tier.agent;
+      const tier = this.route(ticket);
+      if (!tier) {
+        store.updateTicket(ticket.id, { pausedFrom: 'ready' });
+        this.setState(ticket.id, 'paused');
+        continue;
+      }
+      const agent = tier.agent;
       if (this.slotsInUse[agent] >= limits[agent]) continue;
       this.slotsInUse[agent]++;
+      if (tierLabel(tier) !== tierLabel(ticket.tier)) store.updateTicket(ticket.id, { tier });
       this.setState(ticket.id, 'running');
       this.track(this.work(ticket.id));
     }
+  }
+
+  // Routing at run time: the Ticket's own Model Tier, unless its Agent is near its
+  // quota limit; then the other Agent's next more capable tier on the Ladder. None
+  // that can start (that Agent is near its limit too, or there is no tier above): Paused.
+  // A Run its quota cut short waits for that Agent and reruns at the same tier.
+  private route(ticket: StoredTicket): ModelTier | undefined {
+    if (ticket.quotaHold === 'override' || !this.quota.nearLimit(ticket.tier.agent)) return ticket.tier;
+    if (ticket.quotaHold === 'same-tier') return undefined;
+    const other = nextTierOf(this.settings().ladder, ticket.tier, otherAgent(ticket.tier.agent));
+    return other && !this.quota.nearLimit(other.agent) ? other : undefined;
+  }
+
+  // Quota freed: every Paused Ticket that could start now returns to its previous state.
+  private quotaFreed(): void {
+    if (this.stopping.signal.aborted) return;
+    const { store } = this.deps;
+    for (const ticket of store.pausedTickets()) {
+      if (!this.route(ticket)) continue;
+      store.updateTicket(ticket.id, { state: ticket.pausedFrom ?? 'ready', pausedFrom: null });
+      this.emit(ticket.id);
+    }
+    this.schedule();
   }
 
   private freeSlot(agent: Agent): void {
@@ -402,6 +465,13 @@ export class Engine {
         // Back in the queue at the same Model Tier: the next schedule() picks it up.
         // Not started again from here, so a lasting GitHub error can't spin.
         this.setState(id, 'ready');
+        // A quota hit waits for that Agent: Routing pauses it now, not on the next schedule.
+        if (this.deps.store.getTicket(id)!.quotaHold === 'same-tier') this.schedule();
+        return;
+      case 'requeue':
+        // Nothing ran: Routing moves or pauses it with the quota as it is now.
+        this.setState(id, 'ready');
+        this.schedule();
         return;
       case 'failed':
         this.escalate(id, end.outcome, end.reason);
@@ -449,7 +519,12 @@ export class Engine {
         log('Could not prepare the worktree', error);
         return { kind: 'not-a-failure' };
       }
+      // Quota may have changed while the worktree was prepared: decide again before the
+      // Agent starts. The worktree stays as it is; nothing has run in it.
+      const route = this.route(store.getTicket(id)!);
+      if (!route || tierLabel(route) !== tierLabel(ticket.tier)) return { kind: 'requeue' };
       const instructions = runInstructions(ticket, store.lastFailureNote(id));
+      store.updateTicket(id, { quotaHold: null }); // the override and the hold cover one start only
       runId = store.startRun(id, ticket.tier, clock.now());
       this.emit(id);
       agentEnd = await this.runAgent('run', id, ticket.tier, folders, runOutcomeSchema, instructions, runTimeLimitMinutes);
@@ -457,6 +532,8 @@ export class Engine {
       this.freeSlot(ticket.tier.agent);
     }
     const endedAt = clock.now();
+    // Usage is kept whatever the outcome, a quota hit's and a crash's included.
+    if (agentEnd.usage) store.recordRunUsage(runId, priced(ticket.tier, agentEnd.usage));
     if (agentEnd.kind === 'stopped') return { kind: 'stopped' };
     // The Run record shows the Agent's own report as soon as the Agent is done;
     // it gets its final outcome (no commits, red CI, ...) once that is known.
@@ -500,6 +577,8 @@ export class Engine {
       const jobsIfCommitted = () => (commits > 0 ? redJobsSoFar() : Promise.resolve([]));
       switch (agentEnd.kind) {
         case 'quota-hit':
+          // Not a failure: it reruns at the same Model Tier once this Agent's quota frees.
+          store.updateTicket(id, { quotaHold: 'same-tier' });
           store.endRun(runId, endedAt, 'quota-hit', "the Agent's quota ran out mid-Run");
           this.emit(id);
           return { kind: 'not-a-failure' };
@@ -599,6 +678,7 @@ export class Engine {
       `# ${ticket.title}\n\n${ticket.body}`,
       this.settings().runTimeLimitMinutes,
     );
+    if (end.usage) store.recordReviewUsage(reviewId, priced(reviewTier, end.usage));
     if (end.kind !== 'result') throw new NotYetHandled(`Review ended ${end.kind}`);
     const review = end.result;
     store.endReview(reviewId, clock.now(), review.verdict, review.findings);
@@ -653,7 +733,10 @@ export class Engine {
         if (step === 'aborted' || step.done) break;
         const event = step.value;
         if (event.type === 'text') this.emitOutput(ticketId, event.text);
-        if (event.type === 'rate-limit' && event.status === 'rejected') quotaHit = true;
+        if (event.type === 'rate-limit') {
+          this.quota.record(event);
+          if (event.status === 'rejected' && event.agent === tier.agent) quotaHit = true;
+        }
         if (event.type === 'result' && result === undefined) result = schema.parse(event.result);
       }
     } catch (error) {
@@ -668,11 +751,12 @@ export class Engine {
     // A quota hit, once seen, is the outcome: a slow exit that crosses the time
     // limit afterwards must not turn it into a failure. Otherwise the time limit
     // or a bad exit fails the Run even after it reported a result.
-    if (this.stopping.signal.aborted) return { kind: 'stopped' };
-    if (quotaHit) return { kind: 'quota-hit' };
-    if (timeLimit.signal.aborted) return { kind: 'timed-out' };
-    if (crash !== undefined) return { kind: 'crashed', message: crash };
-    if (result !== undefined) return { kind: 'result', result };
+    const usage: { usage?: Usage } = result === undefined ? {} : { usage: (result as { usage: Usage }).usage };
+    if (this.stopping.signal.aborted) return { kind: 'stopped', ...usage };
+    if (quotaHit) return { kind: 'quota-hit', ...usage };
+    if (timeLimit.signal.aborted) return { kind: 'timed-out', ...usage };
+    if (crash !== undefined) return { kind: 'crashed', message: crash, ...usage };
+    if (result !== undefined) return { kind: 'result', result, ...usage };
     return { kind: 'crashed', message: `${mode} ended without a result` };
   }
 }

@@ -9,6 +9,7 @@ export const STATE_LABELS: Record<TicketState, string> = {
   reviewing: 'In review',
   merged: 'Merged',
   handback: 'Handed back',
+  paused: 'Paused',
 };
 
 export const STATE_STYLES: Record<TicketState, string> = {
@@ -18,6 +19,7 @@ export const STATE_STYLES: Record<TicketState, string> = {
   reviewing: 'text-blue-400 bg-blue-500/10',
   merged: 'text-violet-300 bg-violet-400/10',
   handback: 'text-red-300 bg-red-400/10',
+  paused: 'text-orange-300 bg-orange-400/10',
 };
 
 // States where the Orchestrator waits for the user. Handback is here; Awaiting

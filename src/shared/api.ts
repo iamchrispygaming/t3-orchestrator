@@ -15,7 +15,9 @@ export type Door = z.infer<typeof doorSchema>;
 export const agentSchema = modelTierSchema.shape.agent;
 export type Agent = z.infer<typeof agentSchema>;
 
-export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'handback']);
+// paused: quota holds it (every Agent near its limit, or its own Agent ran out
+// mid-Run); it returns to its previous state when quota frees or the user resumes it.
+export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'handback', 'paused']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
 // A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is

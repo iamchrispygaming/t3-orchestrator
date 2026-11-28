@@ -60,6 +60,9 @@ export function createApiClient(fetchFn: FetchFn) {
     async updateParallelLimits(req: UpdateParallelLimitsRequest) {
       return parallelLimitsSchema.parse(await send('PATCH', '/api/settings/parallel-limits', req));
     },
+    async resumeTicket(id: number) {
+      return ticketSchema.parse(await post(`/api/tickets/${id}/resume`, {}));
+    },
     async getTicket(id: number) {
       return ticketDetailSchema.parse(await call(`/api/tickets/${id}`));
     },

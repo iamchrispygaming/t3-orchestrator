@@ -16,6 +16,16 @@ export function tierLabel(tier: ModelTier): string {
   return `${tier.agent}:${tier.model}/${tier.effort}`;
 }
 
+// The first Model Tier of `agent` above `tier` on the Ladder, or undefined when
+// there is none (or `tier` is not on the Ladder). Routing moves a Ticket off an
+// Agent near its quota limit this way.
+export function nextTierOf(ladder: ModelTier[], tier: ModelTier, agent: ModelTier['agent']): ModelTier | undefined {
+  const at = ladder.findIndex((t) => tierLabel(t) === tierLabel(tier));
+  return at < 0 ? undefined : ladder.slice(at + 1).find((t) => t.agent === agent);
+}
+
+export const otherAgent = (agent: ModelTier['agent']): ModelTier['agent'] => (agent === 'claude' ? 'codex' : 'claude');
+
 // The next more capable Model Tier, or undefined at the top. A tier that is not
 // on the Ladder (it was edited away) has nowhere to climb to either.
 export function nextTier(ladder: ModelTier[], tier: ModelTier): ModelTier | undefined {

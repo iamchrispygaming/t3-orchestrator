@@ -17,6 +17,7 @@ import {
 import { planOutcomeSchema, type AgentRunner, type PlanOutcome } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import type { Store, StoredPlan } from './store.ts';
+import { costEstimateNote } from './usage.ts';
 import { RepoWorkspace } from './workspace.ts';
 
 export const PLANNER_TURN_LIMIT_MS = 60 * 60_000;
@@ -258,9 +259,11 @@ export class Planner {
     if (last?.from !== 'user') throw new Error('nothing for the Planner to answer');
     const schema = last.justDraft ? justDraftSchema : turnSchema;
     const reply = last.justDraft ? `${JUST_DRAFT}\n\n${last.text}` : last.text;
+    // The first turn also gets the Cost estimate per Model Tier, for choosing each Ticket's tier.
+    const costNote = costEstimateNote(store.costHistory());
     const instructions = plan.sessionId
       ? reply
-      : `${INTERVIEW_RULES}\n\nTarget Repo: ${repo.owner}/${repo.name} (default branch ${repo.defaultBranch}).\n\nThe idea:\n\n${reply}`;
+      : `${INTERVIEW_RULES}\n\n${costNote ? `${costNote}\n\n` : ''}Target Repo: ${repo.owner}/${repo.name} (default branch ${repo.defaultBranch}).\n\nThe idea:\n\n${reply}`;
     const folders = this.workspace(repo).plannerFolders(id);
 
     const events = this.deps.agentRunner.start({

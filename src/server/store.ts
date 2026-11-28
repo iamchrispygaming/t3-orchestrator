@@ -1,7 +1,9 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
 import type { Blocker } from './github.ts';
+import type { QuotaReading } from './quota.ts';
 import type {
+  Agent,
   Door,
   ModelTier,
   ParallelLimits,
@@ -119,6 +121,23 @@ const migrations: string[] = [
   `ALTER TABLE runs ADD COLUMN failure_note TEXT;
    ALTER TABLE tickets ADD COLUMN handback_reason TEXT;
    ALTER TABLE tickets ADD COLUMN published_head TEXT;`,
+  // Usage and Cost per Run and Review (kept forever), the last quota reading per
+  // Agent, and what a Paused Ticket returns to.
+  `ALTER TABLE runs ADD COLUMN input_tokens INTEGER;
+   ALTER TABLE runs ADD COLUMN output_tokens INTEGER;
+   ALTER TABLE runs ADD COLUMN cost_usd REAL; -- NULL: no usage reported, or no price for the model
+   ALTER TABLE reviews ADD COLUMN input_tokens INTEGER;
+   ALTER TABLE reviews ADD COLUMN output_tokens INTEGER;
+   ALTER TABLE reviews ADD COLUMN cost_usd REAL;
+   CREATE TABLE quota_readings (
+     agent TEXT PRIMARY KEY,
+     status TEXT NOT NULL,
+     resets_at TEXT,
+     utilization REAL,
+     seen_at TEXT NOT NULL
+   );
+   ALTER TABLE tickets ADD COLUMN paused_from TEXT;
+   ALTER TABLE tickets ADD COLUMN quota_hold TEXT;`,
 ];
 
 // Run outcomes that are not failures: the next Run's instructions skip past them
@@ -129,7 +148,10 @@ export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
 
 export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
 
-export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber' | 'handbackReason' | 'publishedHead'> & {
+export type NewTicket = Omit<
+  StoredTicket,
+  'id' | 'repo' | 'prNumber' | 'handbackReason' | 'publishedHead' | 'pausedFrom' | 'quotaHold'
+> & {
   planId: number;
   planPosition: number;
   blockers: Blocker[];
@@ -141,7 +163,21 @@ const SELECT_TICKETS = `SELECT t.*, r.owner || '/' || r.name AS repo
   FROM tickets t JOIN target_repos r ON r.id = t.repo_id`;
 
 // `publishedHead`: the commit the Orchestrator last pushed to the Ticket's branch.
-export type StoredTicket = Ticket & { body: string; publishedHead: string | null };
+// How Routing treats a Ticket's next Run despite quota: 'same-tier' after a quota hit
+// mid-Run (wait for this Agent, never move); 'override' after a manual resume (start now).
+export type QuotaHold = 'same-tier' | 'override';
+
+export type StoredTicket = Ticket & {
+  body: string;
+  publishedHead: string | null;
+  pausedFrom: TicketState | null;
+  quotaHold: QuotaHold | null;
+};
+
+// One Run's or Review's usage, with its Cost when it could be priced.
+export type UsageRecord = { inputTokens: number; outputTokens: number; costUsd: number | null };
+
+export type CostHistoryRow = { kind: 'run' | 'review'; tier: ModelTier; costUsd: number };
 
 export type StoredPlan = {
   id: number;
@@ -358,9 +394,13 @@ export class Store {
       tier?: ModelTier;
       handbackReason?: string;
       publishedHead?: string;
+      pausedFrom?: TicketState | null;
+      quotaHold?: QuotaHold | null;
     },
   ): void {
     if (change.state !== undefined) this.db.prepare('UPDATE tickets SET state = ? WHERE id = ?').run(change.state, id);
+    if (change.pausedFrom !== undefined) this.db.prepare('UPDATE tickets SET paused_from = ? WHERE id = ?').run(change.pausedFrom, id);
+    if (change.quotaHold !== undefined) this.db.prepare('UPDATE tickets SET quota_hold = ? WHERE id = ?').run(change.quotaHold, id);
     if (change.prNumber !== undefined) this.db.prepare('UPDATE tickets SET pr_number = ? WHERE id = ?').run(change.prNumber, id);
     if (change.tier !== undefined) {
       this.db.prepare('UPDATE tickets SET tier = ? WHERE id = ?').run(JSON.stringify(change.tier), id);
@@ -398,6 +438,60 @@ export class Store {
       return row.failure_note == null ? null : String(row.failure_note);
     }
     return null;
+  }
+
+  // The usage a Run's Agent reported, priced as Cost. Recorded whatever the outcome.
+  recordRunUsage(id: number, usage: UsageRecord): void {
+    this.db
+      .prepare('UPDATE runs SET input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?')
+      .run(usage.inputTokens, usage.outputTokens, usage.costUsd, id);
+  }
+
+  recordReviewUsage(id: number, usage: UsageRecord): void {
+    this.db
+      .prepare('UPDATE reviews SET input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?')
+      .run(usage.inputTokens, usage.outputTokens, usage.costUsd, id);
+  }
+
+  pausedTickets(): StoredTicket[] {
+    return (this.db.prepare(`${SELECT_TICKETS} WHERE t.state = 'paused' ORDER BY t.id`).all() as Row[]).map(toTicket);
+  }
+
+  // Every priced Run and Review ever, removed Target Repos' included.
+  costHistory(): CostHistoryRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT 'run' AS kind, tier, cost_usd, 0 AS source, id FROM runs WHERE cost_usd IS NOT NULL
+         UNION ALL SELECT 'review' AS kind, tier, cost_usd, 1 AS source, id FROM reviews WHERE cost_usd IS NOT NULL
+         ORDER BY source, id`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({
+      kind: r.kind as CostHistoryRow['kind'],
+      tier: JSON.parse(String(r.tier)) as ModelTier,
+      costUsd: Number(r.cost_usd),
+    }));
+  }
+
+  getQuotaReading(agent: Agent): QuotaReading | undefined {
+    const row = this.db.prepare('SELECT * FROM quota_readings WHERE agent = ?').get(agent) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      status: String(row.status) as QuotaReading['status'],
+      ...(row.resets_at == null ? {} : { resetsAt: String(row.resets_at) }),
+      ...(row.utilization == null ? {} : { utilization: Number(row.utilization) }),
+      seenAt: String(row.seen_at),
+    };
+  }
+
+  setQuotaReading(agent: Agent, reading: QuotaReading): void {
+    this.db
+      .prepare(
+        `INSERT INTO quota_readings (agent, status, resets_at, utilization, seen_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (agent) DO UPDATE SET status = excluded.status, resets_at = excluded.resets_at,
+           utilization = excluded.utilization, seen_at = excluded.seen_at`,
+      )
+      .run(agent, reading.status, reading.resetsAt ?? null, reading.utilization ?? null, reading.seenAt);
   }
 
   listRuns(ticketId: number): RunRecord[] {
@@ -542,5 +636,7 @@ function toTicket(row: Row): StoredTicket {
     prNumber: row.pr_number == null ? null : Number(row.pr_number),
     handbackReason: row.handback_reason == null ? null : String(row.handback_reason),
     publishedHead: row.published_head == null ? null : String(row.published_head),
+    pausedFrom: row.paused_from == null ? null : (String(row.paused_from) as TicketState),
+    quotaHold: row.quota_hold == null ? null : (String(row.quota_hold) as QuotaHold),
   };
 }
