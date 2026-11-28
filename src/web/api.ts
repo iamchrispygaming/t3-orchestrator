@@ -2,6 +2,8 @@
 // `fetchFn` is the browser's fetch, or the server's in-process handler.
 import { z } from 'zod';
 import {
+  approvedPlanSchema,
+  parallelLimitsSchema,
   planSchema,
   serverEventSchema,
   settingsSchema,
@@ -9,11 +11,13 @@ import {
   ticketDetailSchema,
   ticketSchema,
   type AddTargetRepoRequest,
+  type RegisterApprovedPlanRequest,
   type RegisterTicketRequest,
   type ReplyToPlanRequest,
   type Settings,
   type StartPlanRequest,
   type ServerEvent,
+  type UpdateParallelLimitsRequest,
 } from '../shared/api.ts';
 
 export type FetchFn = (path: string, init?: RequestInit) => Promise<Response>;
@@ -40,6 +44,15 @@ export function createApiClient(fetchFn: FetchFn) {
     },
     async registerTicket(req: RegisterTicketRequest) {
       return ticketSchema.parse(await post('/api/tickets', req));
+    },
+    async registerApprovedPlan(req: RegisterApprovedPlanRequest) {
+      return approvedPlanSchema.parse(await post('/api/approved-plans', req));
+    },
+    async getParallelLimits() {
+      return parallelLimitsSchema.parse(await call('/api/settings/parallel-limits'));
+    },
+    async updateParallelLimits(req: UpdateParallelLimitsRequest) {
+      return parallelLimitsSchema.parse(await send('PATCH', '/api/settings/parallel-limits', req));
     },
     async getTicket(id: number) {
       return ticketDetailSchema.parse(await call(`/api/tickets/${id}`));

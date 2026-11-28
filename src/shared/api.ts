@@ -12,7 +12,10 @@ export type ModelTier = z.infer<typeof modelTierSchema>;
 export const doorSchema = z.enum(['one-way', 'two-way']);
 export type Door = z.infer<typeof doorSchema>;
 
-export const ticketStateSchema = z.enum(['ready', 'running', 'reviewing', 'merged']);
+export const agentSchema = modelTierSchema.shape.agent;
+export type Agent = z.infer<typeof agentSchema>;
+
+export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
 export const addTargetRepoRequestSchema = z.object({
@@ -29,13 +32,24 @@ export const targetRepoSchema = z.object({
 });
 export type TargetRepo = z.infer<typeof targetRepoSchema>;
 
-export const registerTicketRequestSchema = z.object({
-  repoId: z.number().int(),
+const ticketEntrySchema = z.object({
   issueNumber: z.number().int().positive(),
   tier: modelTierSchema,
   door: doorSchema,
 });
+
+// One hand-made Ticket: a one-Ticket Plan, approved on registration.
+export const registerTicketRequestSchema = ticketEntrySchema.extend({ repoId: z.number().int() });
 export type RegisterTicketRequest = z.infer<typeof registerTicketRequestSchema>;
+
+// A hand-made Plan of existing issues, approved on registration (until Plan
+// approval publishes drafts, #38). Its Tickets queue in the order given; their
+// blockers come from GitHub's native dependencies.
+export const registerApprovedPlanRequestSchema = z.object({
+  repoId: z.number().int(),
+  tickets: z.array(ticketEntrySchema).min(1),
+});
+export type RegisterApprovedPlanRequest = z.infer<typeof registerApprovedPlanRequestSchema>;
 
 export const ticketSchema = z.object({
   id: z.number().int(),
@@ -49,6 +63,23 @@ export const ticketSchema = z.object({
   prNumber: z.number().int().nullable(),
 });
 export type Ticket = z.infer<typeof ticketSchema>;
+
+export const approvedPlanSchema = z.object({
+  id: z.number().int(),
+  repoId: z.number().int(),
+  approvedAt: z.iso.datetime(),
+  tickets: z.array(ticketSchema),
+});
+export type ApprovedPlan = z.infer<typeof approvedPlanSchema>;
+
+const parallelLimitSchema = z.number().int().min(1);
+
+// Runs per Agent at once, counted across all Plans and Target Repos.
+export const parallelLimitsSchema = z.object({ claude: parallelLimitSchema, codex: parallelLimitSchema });
+export type ParallelLimits = z.infer<typeof parallelLimitsSchema>;
+
+export const updateParallelLimitsRequestSchema = parallelLimitsSchema.partial();
+export type UpdateParallelLimitsRequest = z.infer<typeof updateParallelLimitsRequestSchema>;
 
 export const runRecordSchema = z.object({
   tier: modelTierSchema,

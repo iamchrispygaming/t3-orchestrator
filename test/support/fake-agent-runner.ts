@@ -49,10 +49,17 @@ export const round = (questions: PlanQuestion[], over: Partial<PlanOutcome> = {}
 export const drafted = (draft: PlanDraft, over: Partial<PlanOutcome> = {}): PlanOutcome =>
   round([], { message: 'Here is the draft.', draft, ...over });
 
-// Scriptable per call: queue a handler per mode; each start() takes the next one.
+// Scriptable per call: queue a handler per mode; each start() takes the next one,
+// falling back to the mode's `otherwise` handler once the queue is empty.
 export class FakeAgentRunner implements AgentRunner {
   readonly calls: RunRequest[] = [];
   private queues = new Map<RunMode, Handler[]>();
+  private fallbacks = new Map<RunMode, Handler>();
+
+  otherwise(mode: RunMode, handler: Handler): this {
+    this.fallbacks.set(mode, handler);
+    return this;
+  }
 
   script(mode: RunMode, handler: Handler): this {
     const queue = this.queues.get(mode) ?? [];
@@ -63,7 +70,7 @@ export class FakeAgentRunner implements AgentRunner {
 
   async *start(req: RunRequest): AsyncIterable<RunEvent> {
     this.calls.push(req);
-    const handler = this.queues.get(req.mode)?.shift();
+    const handler = this.queues.get(req.mode)?.shift() ?? this.fallbacks.get(req.mode);
     if (!handler) throw new Error(`fake AgentRunner has no script left for a ${req.mode}`);
     yield { type: 'text', text: `fake ${req.mode} started` };
     yield { type: 'result', result: await handler(req) };

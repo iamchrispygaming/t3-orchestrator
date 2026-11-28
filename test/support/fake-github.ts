@@ -11,6 +11,8 @@ export type FakePullRequest = NewPullRequest & {
 type FakeRepo = {
   info: RepoInfo;
   issues: Map<number, Issue>;
+  blockedBy: Map<number, number[]>; // native issue dependencies
+
   pulls: FakePullRequest[];
   checks: ChecksState;
 };
@@ -25,13 +27,26 @@ export class FakeGitHub implements GitHub {
     this.repos.set(`${owner}/${name}`, {
       info: { defaultBranch, cloneUrl: remotePath },
       issues: new Map(),
+      blockedBy: new Map(),
       pulls: [],
       checks: 'success',
     });
   }
 
-  addIssue(owner: string, name: string, issue: { number: number; title: string; body: string }): void {
-    this.repo(owner, name).issues.set(issue.number, { ...issue, state: 'open' });
+  addIssue(
+    owner: string,
+    name: string,
+    { blockedBy = [], ...issue }: { number: number; title: string; body: string; blockedBy?: number[] },
+  ): void {
+    const repo = this.repo(owner, name);
+    repo.issues.set(issue.number, { ...issue, state: 'open' });
+    repo.blockedBy.set(issue.number, blockedBy);
+  }
+
+  closeIssue(owner: string, name: string, number: number): void {
+    const issue = this.repo(owner, name).issues.get(number);
+    if (!issue) throw new Error(`no issue #${number} on ${owner}/${name}`);
+    issue.state = 'closed';
   }
 
   issue(owner: string, name: string, number: number): Issue | undefined {
@@ -59,6 +74,15 @@ export class FakeGitHub implements GitHub {
     const issue = this.repo(owner, name).issues.get(number);
     if (!issue) throw new Error(`no issue #${number} on ${owner}/${name}`);
     return { ...issue };
+  }
+
+  async getBlockers(owner: string, name: string, number: number): Promise<Issue[]> {
+    const repo = this.repo(owner, name);
+    return (repo.blockedBy.get(number) ?? []).map((n) => {
+      const issue = repo.issues.get(n);
+      if (!issue) throw new Error(`no issue #${n} on ${owner}/${name}`);
+      return { ...issue };
+    });
   }
 
   async createPullRequest(owner: string, name: string, pr: NewPullRequest): Promise<{ number: number }> {

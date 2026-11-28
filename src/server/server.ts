@@ -7,10 +7,12 @@ import { streamSSE } from 'hono/streaming';
 import type { z } from 'zod';
 import {
   addTargetRepoRequestSchema,
+  registerApprovedPlanRequestSchema,
   registerTicketRequestSchema,
   replyToPlanRequestSchema,
   settingsSchema,
   startPlanRequestSchema,
+  updateParallelLimitsRequestSchema,
   type ServerEvent,
   type TicketDetail,
 } from '../shared/api.ts';
@@ -82,6 +84,20 @@ export function createServer(deps: ServerDeps): Server {
     const req = await parseBody(c.req.json(), registerTicketRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await engine.registerTicket(req.data), 201);
+  });
+
+  app.post('/api/approved-plans', async (c) => {
+    const req = await parseBody(c.req.json(), registerApprovedPlanRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(await engine.registerApprovedPlan(req.data), 201);
+  });
+
+  app.get('/api/settings/parallel-limits', (c) => c.json(engine.parallelLimits()));
+
+  app.patch('/api/settings/parallel-limits', async (c) => {
+    const req = await parseBody(c.req.json(), updateParallelLimitsRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(engine.updateParallelLimits(req.data));
   });
 
   app.get('/api/tickets/:id', (c) => {

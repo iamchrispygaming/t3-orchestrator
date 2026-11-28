@@ -10,6 +10,8 @@ export type MergeMethod = 'squash';
 export interface GitHub {
   getRepo(owner: string, name: string): Promise<RepoInfo>;
   getIssue(owner: string, name: string, number: number): Promise<Issue>;
+  // The issues blocking this one (native GitHub issue dependencies, same repo).
+  getBlockers(owner: string, name: string, number: number): Promise<Issue[]>;
   createPullRequest(owner: string, name: string, pr: NewPullRequest): Promise<{ number: number }>;
   getChecks(owner: string, name: string, ref: string): Promise<ChecksState>;
   mergePullRequest(owner: string, name: string, number: number, method: MergeMethod): Promise<void>;
