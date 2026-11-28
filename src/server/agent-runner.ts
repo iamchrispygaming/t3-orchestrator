@@ -53,7 +53,8 @@ export type RunEvent =
   | { type: 'text'; text: string }
   | { type: 'tool'; name: string; detail: string }
   // A quota reading seen mid-Run, for the quota port. `near-limit` means slow down;
-  // `rejected` means no more quota until `resetsAt`.
+  // `rejected` means no more quota until `resetsAt`: a quota hit, which is not a
+  // failure and uses up no Model Tier.
   | {
       type: 'rate-limit';
       agent: ModelTier['agent'];
@@ -77,6 +78,8 @@ export type RunRequest = {
   signal: AbortSignal;
 };
 
+// A Run that crashes or exits non-zero throws from the iterable, or ends without a
+// 'result' event. Aborting `signal` (the Run time limit, a server stop) must end it.
 export interface AgentRunner {
   start(req: RunRequest): AsyncIterable<RunEvent>;
 }

@@ -9,7 +9,9 @@ import type {
   RunRequest,
 } from '../../src/server/agent-runner.ts';
 
-type Outcome = RunOutcome | ReviewOutcome | PlanOutcome;
+// Endings other than a result: the Agent's quota runs out, or it exits without a result.
+type FakeEnding = { fake: 'quota-hit' } | { fake: 'no-result' };
+type Outcome = RunOutcome | ReviewOutcome | PlanOutcome | FakeEnding;
 type Handler = (req: RunRequest) => Promise<Outcome> | Outcome;
 
 const noUsage = { inputTokens: 0, outputTokens: 0 };
@@ -49,11 +51,32 @@ export const round = (questions: PlanQuestion[], over: Partial<PlanOutcome> = {}
 export const drafted = (draft: PlanDraft, over: Partial<PlanOutcome> = {}): PlanOutcome =>
   round([], { message: 'Here is the draft.', draft, ...over });
 
+// The quota runs out mid-Run: a `rejected` rate-limit event, then the stream ends.
+export const quotaHit = (): FakeEnding => ({ fake: 'quota-hit' });
+export const noResult = (): FakeEnding => ({ fake: 'no-result' });
+
+// Never settles until the Run is aborted (time limit, server stop), then rejects like a killed process.
+export const hang = (req: RunRequest): Promise<never> =>
+  new Promise((_, reject) => {
+    if (req.signal.aborted) reject(new Error('aborted'));
+    req.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+  });
+
+export const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type Script = {
+  handler: Handler;
+  // Runs as the Agent winds down, like a process exiting: after its last event,
+  // when the engine closes the stream, or after an abort. It can be slow.
+  shutdown?: (req: RunRequest) => Promise<void> | void;
+};
+
 // Scriptable per call: queue a handler per mode; each start() takes the next one,
 // falling back to the mode's `otherwise` handler once the queue is empty.
+// A handler that throws is a crash.
 export class FakeAgentRunner implements AgentRunner {
   readonly calls: RunRequest[] = [];
-  private queues = new Map<RunMode, Handler[]>();
+  private queues = new Map<RunMode, Script[]>();
   private fallbacks = new Map<RunMode, Handler>();
 
   otherwise(mode: RunMode, handler: Handler): this {
@@ -61,18 +84,28 @@ export class FakeAgentRunner implements AgentRunner {
     return this;
   }
 
-  script(mode: RunMode, handler: Handler): this {
+  script(mode: RunMode, handler: Handler, options: Omit<Script, 'handler'> = {}): this {
     const queue = this.queues.get(mode) ?? [];
-    queue.push(handler);
+    queue.push({ handler, ...options });
     this.queues.set(mode, queue);
     return this;
   }
 
   async *start(req: RunRequest): AsyncIterable<RunEvent> {
     this.calls.push(req);
-    const handler = this.queues.get(req.mode)?.shift() ?? this.fallbacks.get(req.mode);
-    if (!handler) throw new Error(`fake AgentRunner has no script left for a ${req.mode}`);
-    yield { type: 'text', text: `fake ${req.mode} started` };
-    yield { type: 'result', result: await handler(req) };
+    const fallback = this.fallbacks.get(req.mode);
+    const script: Script | undefined = this.queues.get(req.mode)?.shift() ?? (fallback && { handler: fallback });
+    if (!script) throw new Error(`fake AgentRunner has no script left for a ${req.mode}`);
+    try {
+      yield { type: 'text', text: `fake ${req.mode} started` };
+      const outcome = await script.handler(req);
+      if ('fake' in outcome) {
+        if (outcome.fake === 'quota-hit') yield { type: 'rate-limit', agent: req.tier.agent, status: 'rejected' };
+        return;
+      }
+      yield { type: 'result', result: outcome };
+    } finally {
+      await script.shutdown?.(req);
+    }
   }
 }

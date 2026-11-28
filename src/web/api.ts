@@ -14,10 +14,10 @@ import {
   type RegisterApprovedPlanRequest,
   type RegisterTicketRequest,
   type ReplyToPlanRequest,
-  type Settings,
   type StartPlanRequest,
   type ServerEvent,
   type UpdateParallelLimitsRequest,
+  type UpdateSettingsRequest,
 } from '../shared/api.ts';
 
 export type FetchFn = (path: string, init?: RequestInit) => Promise<Response>;
@@ -66,8 +66,8 @@ export function createApiClient(fetchFn: FetchFn) {
     async getSettings() {
       return settingsSchema.parse(await call('/api/settings'));
     },
-    async updateSettings(settings: Settings) {
-      return settingsSchema.parse(await send('PUT', '/api/settings', settings));
+    async updateSettings(change: UpdateSettingsRequest) {
+      return settingsSchema.parse(await send('PUT', '/api/settings', change));
     },
     async startPlan(req: StartPlanRequest) {
       return planSchema.parse(await post('/api/plans', req));

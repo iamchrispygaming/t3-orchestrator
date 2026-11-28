@@ -15,7 +15,7 @@ export type Door = z.infer<typeof doorSchema>;
 export const agentSchema = modelTierSchema.shape.agent;
 export type Agent = z.infer<typeof agentSchema>;
 
-export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged']);
+export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'handback']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
 // A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is
@@ -67,6 +67,7 @@ export const ticketSchema = z.object({
   door: doorSchema,
   state: ticketStateSchema,
   prNumber: z.number().int().nullable(),
+  handbackReason: z.string().nullable(), // why the Ticket is the user's now; set only in Handback
 });
 export type Ticket = z.infer<typeof ticketSchema>;
 
@@ -87,12 +88,30 @@ export type ParallelLimits = z.infer<typeof parallelLimitsSchema>;
 export const updateParallelLimitsRequestSchema = parallelLimitsSchema.partial();
 export type UpdateParallelLimitsRequest = z.infer<typeof updateParallelLimitsRequestSchema>;
 
+// How a Run ended. The Agent's own report (done, failed, cannot, needs-permission),
+// or what the Orchestrator saw: a crash or exit without a result, the Run time limit,
+// no commits, red CI. `quota-hit` and `interrupted` (Orchestrator or GitHub errors)
+// are not failures: they use up no Model Tier.
+export const runOutcomeKindSchema = z.enum([
+  'done',
+  'failed',
+  'cannot',
+  'needs-permission',
+  'crashed',
+  'timed-out',
+  'no-commits',
+  'ci-failed',
+  'quota-hit',
+  'interrupted',
+]);
+export type RunOutcomeKind = z.infer<typeof runOutcomeKindSchema>;
+
 export const runRecordSchema = z.object({
   tier: modelTierSchema,
   startedAt: z.iso.datetime(),
   endedAt: z.iso.datetime().nullable(),
-  outcome: z.enum(['done', 'failed', 'cannot', 'needs-permission']).nullable(),
-  reason: z.string().nullable(), // why it failed; null while running or when it succeeded
+  outcome: runOutcomeKindSchema.nullable(),
+  reason: z.string().nullable(), // why it failed or was cut short; null while running or when it succeeded
 });
 export type RunRecord = z.infer<typeof runRecordSchema>;
 
@@ -177,8 +196,33 @@ export const replyToPlanRequestSchema = z.union([
 ]);
 export type ReplyToPlanRequest = z.infer<typeof replyToPlanRequestSchema>;
 
-export const settingsSchema = z.object({ plannerTier: modelTierSchema });
+// The settings the engine reads for Escalation.
+export const escalationSettingsSchema = z.object({
+  // Least to most capable. Escalation climbs it one Model Tier per failure, so a
+  // tier listed twice would be retried forever.
+  ladder: z
+    .array(modelTierSchema)
+    .min(1)
+    .refine(
+      (ladder) => new Set(ladder.map((t) => `${t.agent}:${t.model}/${t.effort}`)).size === ladder.length,
+      'the Ladder lists a Model Tier twice',
+    ),
+  // At most what a Node timer can hold (2^31 - 1 ms, about 24 days); a longer
+  // delay would fire almost at once.
+  runTimeLimitMinutes: z
+    .number()
+    .int()
+    .positive()
+    .max(Math.floor((2 ** 31 - 1) / 60_000)),
+});
+export type EscalationSettings = z.infer<typeof escalationSettingsSchema>;
+
+export const settingsSchema = escalationSettingsSchema.extend({ plannerTier: modelTierSchema });
 export type Settings = z.infer<typeof settingsSchema>;
+
+// PUT /api/settings changes only the settings it names.
+export const updateSettingsRequestSchema = settingsSchema.partial();
+export type UpdateSettingsRequest = z.infer<typeof updateSettingsRequestSchema>;
 
 // Server-Sent Events on GET /api/events. The first event is always a snapshot.
 export const serverEventSchema = z.discriminatedUnion('type', [
