@@ -18,9 +18,14 @@ export type Agent = z.infer<typeof agentSchema>;
 export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
+// A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is
+// refused. Owners may hold `_`: Enterprise Managed User names end in `_<shortcode>`.
 export const addTargetRepoRequestSchema = z.object({
-  owner: z.string().min(1),
-  name: z.string().min(1),
+  owner: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/, 'not a GitHub owner'),
+  name: z
+    .string()
+    .regex(/^[A-Za-z0-9._-]{1,100}$/, 'not a GitHub repository name')
+    .refine((name) => name !== '.' && name !== '..', 'not a GitHub repository name'),
 });
 export type AddTargetRepoRequest = z.infer<typeof addTargetRepoRequestSchema>;
 

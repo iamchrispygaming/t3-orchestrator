@@ -42,6 +42,12 @@ export function createApiClient(fetchFn: FetchFn) {
     async addTargetRepo(req: AddTargetRepoRequest) {
       return targetRepoSchema.parse(await post('/api/repos', req));
     },
+    async listTargetRepos() {
+      return z.array(targetRepoSchema).parse(await call('/api/repos'));
+    },
+    async removeTargetRepo(id: number) {
+      await call(`/api/repos/${id}`, { method: 'DELETE' });
+    },
     async registerTicket(req: RegisterTicketRequest) {
       return ticketSchema.parse(await post('/api/tickets', req));
     },

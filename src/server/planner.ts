@@ -63,6 +63,7 @@ export class Planner {
   private listeners = new Set<(event: PlanEvent) => void>();
   private inFlight = new Set<Promise<void>>();
   private aborts = new Map<number, AbortController>();
+  private turns = new Map<number, Promise<void>>(); // each Plan's turn in progress
   private stopping = new AbortController();
   private deps: PlannerDeps;
 
@@ -98,10 +99,11 @@ export class Planner {
     const { store, clock } = this.deps;
     const repo = store.getTargetRepo(req.repoId);
     if (!repo) throw new PlanNotFound(`no Target Repo ${req.repoId}`);
+    if (store.isTargetRepoRemoving(repo.id)) throw new PlanBusy(`${repo.owner}/${repo.name} is being removed`);
     // The tier is fixed per Plan: a resumed session never moves to another Agent or model.
     const plan = store.addPlan({ repoId: repo.id, tier: this.plannerTier(), idea: req.idea, createdAt: clock.now() });
     this.emit(plan.id);
-    this.track(this.turn(plan.id));
+    this.startTurn(plan.id);
     return this.plan(plan.id);
   }
 
@@ -110,11 +112,13 @@ export class Planner {
     const plan = store.getPlan(id);
     if (!plan) throw new PlanNotFound(`no Plan ${id}`);
     if (plan.status === 'thinking') throw new PlanBusy(`Plan ${id} is waiting on the Planner`);
+    const repo = store.getTargetRepo(plan.repoId);
+    if (repo && store.isTargetRepoRemoving(repo.id)) throw new PlanBusy(`${repo.owner}/${repo.name} is being removed`);
     const justDraft = req.justDraft === true || isJustDraft(req.text);
     store.addPlanMessage(id, { from: 'user', text: req.text ?? 'Just draft it.', justDraft, at: clock.now().toISOString() });
     store.updatePlan(id, { status: 'thinking' });
     this.emit(id);
-    this.track(this.turn(id));
+    this.startTurn(id);
     return this.plan(id);
   }
 
@@ -132,13 +136,40 @@ export class Planner {
   // After a restart: redo every turn the last server stop cut short.
   resume(): void {
     for (const plan of this.deps.store.listPlans()) {
-      if (plan.status === 'thinking') this.track(this.turn(plan.id));
+      if (plan.status === 'thinking') this.startTurn(plan.id);
+    }
+  }
+
+  // Before a Target Repo's folder is deleted: stops its Plans' turns and waits until
+  // they have let go of the folder. Turns cut short end as failed.
+  async stopTurnsOn(repoId: number): Promise<void> {
+    const plans = this.deps.store.listPlans().filter((p) => p.repoId === repoId);
+    for (const plan of plans) this.aborts.get(plan.id)?.abort();
+    await Promise.allSettled(plans.map((p) => this.turns.get(p.id)));
+    for (const plan of plans) {
+      if (this.deps.store.getPlan(plan.id)?.status === 'thinking') this.fail(plan.id, 'the Target Repo is being removed');
     }
   }
 
   async stop(): Promise<void> {
     this.stopping.abort();
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
+  }
+
+  private startTurn(id: number): void {
+    const turn = this.turn(id);
+    this.turns.set(id, turn);
+    this.track(turn);
+    void turn.catch(() => undefined).finally(() => {
+      if (this.turns.get(id) === turn) this.turns.delete(id);
+    });
+  }
+
+  private fail(id: number, reason: string): void {
+    const { store, clock } = this.deps;
+    store.addPlanMessage(id, { from: 'planner', text: `The Planner stopped: ${reason}`, round: null, at: clock.now().toISOString() });
+    store.updatePlan(id, { status: 'failed' });
+    this.emit(id);
   }
 
   private track(work: Promise<void>): void {
@@ -166,6 +197,11 @@ export class Planner {
   private async turn(id: number): Promise<void> {
     const { store, clock } = this.deps;
     const repoId = store.getPlan(id)?.repoId;
+    // A repo being removed (or gone) takes no Planner work: its folder is about to go.
+    if (repoId !== undefined && (!store.getTargetRepo(repoId) || store.isTargetRepoRemoving(repoId))) {
+      this.fail(id, 'the Target Repo is being removed');
+      return;
+    }
     const abort = new AbortController();
     this.aborts.set(id, abort);
     // A discard aborts the turn; ids are never reused, so this also guards a later Plan.
@@ -188,10 +224,7 @@ export class Planner {
       // A server stop leaves the turn 'thinking' so the restart redoes it.
       if (this.stopping.signal.aborted || abort.signal.aborted || !store.getPlan(id)) return;
       this.deps.log(`Planner turn on Plan ${id} failed`, error);
-      const reason = error instanceof Error ? error.message : String(error);
-      store.addPlanMessage(id, { from: 'planner', text: `The Planner stopped: ${reason}`, round: null, at: clock.now().toISOString() });
-      store.updatePlan(id, { status: 'failed' });
-      this.emit(id);
+      this.fail(id, error instanceof Error ? error.message : String(error));
     } finally {
       if (this.aborts.get(id) === abort) this.aborts.delete(id);
       // A discard during setup can race the checkout into existence again; clear it here.

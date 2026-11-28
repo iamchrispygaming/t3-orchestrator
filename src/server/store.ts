@@ -92,6 +92,27 @@ const migrations: string[] = [
      merged INTEGER NOT NULL DEFAULT 0, -- GitHub showed a merged PR closing it
      PRIMARY KEY (ticket_id, owner, name, issue_number)
    );`,
+  // Target Repo removal. Each registration of a repo gets its own row and an id that is
+  // never reused (AUTOINCREMENT), so a request naming an old registration can never act
+  // on a newer one; a removed row stays, so its Tickets' Runs and Reviews stay on record.
+  // The table is rebuilt to drop the old UNIQUE (owner, name), which forced id reuse.
+  // GitHub matches owner/repo whatever the case, so one repo has one live row. An older
+  // data folder may hold one repo under several spellings: the first one added is kept.
+  `CREATE TABLE target_repos_new (
+     id INTEGER PRIMARY KEY AUTOINCREMENT,
+     owner TEXT NOT NULL,
+     name TEXT NOT NULL,
+     default_branch TEXT NOT NULL,
+     removing_since TEXT, -- cleanup started; no new work until it finishes
+     removed_at TEXT
+   );
+   INSERT INTO target_repos_new (id, owner, name, default_branch)
+     SELECT id, owner, name, default_branch FROM target_repos;
+   DROP TABLE target_repos;
+   ALTER TABLE target_repos_new RENAME TO target_repos;
+   UPDATE target_repos SET removed_at = '1970-01-01T00:00:00.000Z'
+     WHERE id NOT IN (SELECT min(id) FROM target_repos GROUP BY lower(owner), lower(name));
+   CREATE UNIQUE INDEX target_repos_live ON target_repos (lower(owner), lower(name)) WHERE removed_at IS NULL;`,
 ];
 
 export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
@@ -133,19 +154,29 @@ export class Store {
 
   private migrate(): void {
     const { user_version: applied } = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
-    for (let version = applied; version < migrations.length; version++) {
-      this.db.exec('BEGIN');
-      try {
-        this.db.exec(migrations[version]!);
-        this.db.exec(`PRAGMA user_version = ${version + 1}`);
-        this.db.exec('COMMIT');
-      } catch (error) {
-        this.db.exec('ROLLBACK');
-        throw error;
+    // SQLite's way to rebuild a table others point at: foreign keys off (it can't be
+    // switched inside a transaction), then every reference checked before committing.
+    this.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      for (let version = applied; version < migrations.length; version++) {
+        this.db.exec('BEGIN');
+        try {
+          this.db.exec(migrations[version]!);
+          const broken = this.db.prepare('PRAGMA foreign_key_check').all();
+          if (broken.length > 0) throw new Error(`migration ${version + 1} broke references: ${JSON.stringify(broken)}`);
+          this.db.exec(`PRAGMA user_version = ${version + 1}`);
+          this.db.exec('COMMIT');
+        } catch (error) {
+          this.db.exec('ROLLBACK');
+          throw error;
+        }
       }
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON');
     }
   }
 
+  // Every registration gets a fresh id, even for a repo that was added and removed before.
   addTargetRepo(repo: Omit<TargetRepo, 'id'>): TargetRepo {
     const { lastInsertRowid } = this.db
       .prepare('INSERT INTO target_repos (owner, name, default_branch) VALUES (?, ?, ?)')
@@ -153,9 +184,50 @@ export class Store {
     return { id: Number(lastInsertRowid), ...repo };
   }
 
+  // Only Target Repos the user has not removed (a removal under way still counts);
+  // removed ones are history. Owner and repo names compare without case, as on GitHub.
   getTargetRepo(id: number): TargetRepo | undefined {
-    const row = this.db.prepare('SELECT * FROM target_repos WHERE id = ?').get(id) as Row | undefined;
-    return row && { id: Number(row.id), owner: String(row.owner), name: String(row.name), defaultBranch: String(row.default_branch) };
+    const row = this.db
+      .prepare('SELECT * FROM target_repos WHERE id = ? AND removed_at IS NULL')
+      .get(id) as Row | undefined;
+    return row && toTargetRepo(row);
+  }
+
+  findTargetRepo(owner: string, name: string): TargetRepo | undefined {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM target_repos WHERE lower(owner) = lower(?) AND lower(name) = lower(?) AND removed_at IS NULL',
+      )
+      .get(owner, name) as Row | undefined;
+    return row && toTargetRepo(row);
+  }
+
+  listTargetRepos(): TargetRepo[] {
+    const rows = this.db.prepare('SELECT * FROM target_repos WHERE removed_at IS NULL ORDER BY id').all() as Row[];
+    return rows.map(toTargetRepo);
+  }
+
+  // Set when removal starts and kept until it finishes, across restarts too.
+  isTargetRepoRemoving(id: number): boolean {
+    const row = this.db.prepare('SELECT removing_since FROM target_repos WHERE id = ?').get(id) as Row | undefined;
+    return row?.removing_since != null;
+  }
+
+  markTargetRepoRemoving(id: number, since: Date): void {
+    this.db
+      .prepare('UPDATE target_repos SET removing_since = ? WHERE id = ? AND removing_since IS NULL')
+      .run(since.toISOString(), id);
+  }
+
+  markTargetRepoRemoved(id: number, removedAt: Date): void {
+    this.db.prepare('UPDATE target_repos SET removed_at = ? WHERE id = ?').run(removedAt.toISOString(), id);
+  }
+
+  listRunIds(repoId: number): number[] {
+    const rows = this.db
+      .prepare('SELECT runs.id FROM runs JOIN tickets ON tickets.id = runs.ticket_id WHERE tickets.repo_id = ?')
+      .all(repoId) as Row[];
+    return rows.map((r) => Number(r.id));
   }
 
   transaction<T>(work: () => T): T {
@@ -234,7 +306,8 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT t.* FROM tickets t LEFT JOIN approved_plans p ON p.id = t.plan_id
-         WHERE t.state = 'ready'
+         JOIN target_repos r ON r.id = t.repo_id
+         WHERE t.state = 'ready' AND r.removing_since IS NULL AND r.removed_at IS NULL -- no work on a repo being removed
          ORDER BY p.approved_at, p.id, t.plan_position, t.id`,
       )
       .all() as Row[];
@@ -255,8 +328,19 @@ export class Store {
     return row && toTicket(row);
   }
 
+  // Tickets on Target Repos the user has not removed.
   listTickets(): StoredTicket[] {
-    return (this.db.prepare('SELECT * FROM tickets ORDER BY id').all() as Row[]).map(toTicket);
+    const rows = this.db
+      .prepare(
+        `SELECT tickets.* FROM tickets JOIN target_repos ON target_repos.id = tickets.repo_id
+         WHERE target_repos.removed_at IS NULL ORDER BY tickets.id`,
+      )
+      .all() as Row[];
+    return rows.map(toTicket);
+  }
+
+  listTicketsOfRepo(repoId: number): StoredTicket[] {
+    return (this.db.prepare('SELECT * FROM tickets WHERE repo_id = ? ORDER BY id').all(repoId) as Row[]).map(toTicket);
   }
 
   updateTicket(id: number, change: { state?: TicketState; prNumber?: number }): void {
@@ -396,6 +480,10 @@ function toPlan(row: Row): StoredPlan {
     sessionId: row.session_id == null ? null : String(row.session_id),
     draft: row.draft == null ? null : (JSON.parse(String(row.draft)) as PlanDraft),
   };
+}
+
+function toTargetRepo(row: Row): TargetRepo {
+  return { id: Number(row.id), owner: String(row.owner), name: String(row.name), defaultBranch: String(row.default_branch) };
 }
 
 function toTicket(row: Row): StoredTicket {

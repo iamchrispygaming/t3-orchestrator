@@ -19,7 +19,8 @@ import {
 import type { AgentRunner } from './agent-runner.ts';
 import { systemClock, type Clock } from './clock.ts';
 import { resolveDataFolder } from './data-folder.ts';
-import { Engine } from './engine.ts';
+import { Engine, NotFound, Refused } from './engine.ts';
+import { GhNotLoggedIn, type GhAuth } from './gh-auth.ts';
 import type { GitHub } from './github.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
 import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
@@ -39,6 +40,19 @@ export type Server = {
   close(): Promise<void>;
 };
 
+export type StartDeps = Omit<ServerDeps, 'github'> & {
+  ghAuth: GhAuth;
+  // Builds the GitHub client from the gh token, which stays in its memory only.
+  github: (token: string) => GitHub;
+};
+
+// Startup: reads the gh login first and refuses without one.
+export async function startServer(deps: StartDeps): Promise<Server> {
+  const token = await deps.ghAuth.token();
+  if (!token) throw new GhNotLoggedIn();
+  return createServer({ ...deps, github: deps.github(token) });
+}
+
 export function createServer(deps: ServerDeps): Server {
   const dataFolder = resolveDataFolder(deps.env);
   mkdirSync(dataFolder, { recursive: true });
@@ -51,6 +65,7 @@ export function createServer(deps: ServerDeps): Server {
     notifier: deps.notifier ?? silentNotifier,
     dataFolder,
     log: deps.log ?? ((message, error) => console.error(message, error)),
+    stopPlannerWork: (repoId) => planner.stopTurnsOn(repoId),
   });
   const planner = new Planner({
     store,
@@ -69,15 +84,22 @@ export function createServer(deps: ServerDeps): Server {
   }
 
   app.onError((error, c) => {
-    if (error instanceof PlanNotFound) return c.json({ error: error.message }, 404);
-    if (error instanceof PlanBusy) return c.json({ error: error.message }, 409);
+    if (error instanceof PlanNotFound || error instanceof NotFound) return c.json({ error: error.message }, 404);
+    if (error instanceof PlanBusy || error instanceof Refused) return c.json({ error: error.message }, 409);
     return c.json({ error: error.message }, 500);
   });
+
+  app.get('/api/repos', (c) => c.json(engine.targetRepos()));
 
   app.post('/api/repos', async (c) => {
     const req = await parseBody(c.req.json(), addTargetRepoRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await engine.addTargetRepo(req.data.owner, req.data.name), 201);
+  });
+
+  app.delete('/api/repos/:id', async (c) => {
+    await engine.removeTargetRepo(Number(c.req.param('id')));
+    return c.json({});
   });
 
   app.post('/api/tickets', async (c) => {
@@ -102,7 +124,7 @@ export function createServer(deps: ServerDeps): Server {
 
   app.get('/api/tickets/:id', (c) => {
     const id = Number(c.req.param('id'));
-    const ticket = engine.tickets().find((t) => t.id === id);
+    const ticket = engine.ticket(id); // a removed Target Repo's Tickets stay readable as history
     if (!ticket) return c.json({ error: `no Ticket ${id}` }, 404);
     const detail: TicketDetail = { ...ticket, runs: store.listRuns(id), reviews: store.listReviews(id) };
     return c.json(detail);
