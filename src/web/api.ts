@@ -1,12 +1,18 @@
 // Typed client for the Orchestrator's API, used by the web UI (and the tests).
 // `fetchFn` is the browser's fetch, or the server's in-process handler.
+import { z } from 'zod';
 import {
+  planSchema,
   serverEventSchema,
+  settingsSchema,
   targetRepoSchema,
   ticketDetailSchema,
   ticketSchema,
   type AddTargetRepoRequest,
   type RegisterTicketRequest,
+  type ReplyToPlanRequest,
+  type Settings,
+  type StartPlanRequest,
   type ServerEvent,
 } from '../shared/api.ts';
 
@@ -24,8 +30,9 @@ export function createApiClient(fetchFn: FetchFn) {
     if (!res.ok) throw new Error(`${init?.method ?? 'GET'} ${path} failed (${res.status}): ${JSON.stringify(body)}`);
     return body;
   }
-  const post = (path: string, body: unknown) =>
-    call(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const send = (method: string, path: string, body: unknown) =>
+    call(path, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const post = (path: string, body: unknown) => send('POST', path, body);
 
   return {
     async addTargetRepo(req: AddTargetRepoRequest) {
@@ -36,6 +43,27 @@ export function createApiClient(fetchFn: FetchFn) {
     },
     async getTicket(id: number) {
       return ticketDetailSchema.parse(await call(`/api/tickets/${id}`));
+    },
+    async getSettings() {
+      return settingsSchema.parse(await call('/api/settings'));
+    },
+    async updateSettings(settings: Settings) {
+      return settingsSchema.parse(await send('PUT', '/api/settings', settings));
+    },
+    async startPlan(req: StartPlanRequest) {
+      return planSchema.parse(await post('/api/plans', req));
+    },
+    async listPlans() {
+      return z.array(planSchema).parse(await call('/api/plans'));
+    },
+    async getPlan(id: number) {
+      return planSchema.parse(await call(`/api/plans/${id}`));
+    },
+    async replyToPlan(id: number, req: ReplyToPlanRequest) {
+      return planSchema.parse(await post(`/api/plans/${id}/messages`, req));
+    },
+    async discardPlan(id: number) {
+      await call(`/api/plans/${id}`, { method: 'DELETE' });
     },
     async events(): Promise<EventStream> {
       const res = await fetchFn('/api/events', { headers: { accept: 'text/event-stream' } });

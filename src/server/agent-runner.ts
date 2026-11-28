@@ -1,7 +1,7 @@
 // The Run port (ADR 0002): one narrow interface for starting an Agent run at a
 // Model Tier in a worktree. Runs, Reviews and the Planner all use it.
 import { z } from 'zod';
-import type { ModelTier } from '../shared/api.ts';
+import { planDraftSchema, planQuestionSchema, type ModelTier } from '../shared/api.ts';
 
 export type JsonSchema = Record<string, unknown>;
 
@@ -32,10 +32,22 @@ export const reviewOutcomeSchema = z.object({
   usage: usageSchema,
 });
 
-export const runResultSchema = z.discriminatedUnion('kind', [runOutcomeSchema, reviewOutcomeSchema]);
+// One Planner turn: its chat message, the next round of questions (none once it
+// drafts) and the whole current draft. `sessionId` resumes the session next turn.
+export const planOutcomeSchema = z.object({
+  kind: z.literal('plan'),
+  sessionId: z.string().min(1),
+  message: z.string(),
+  questions: z.array(planQuestionSchema),
+  draft: planDraftSchema.nullable(),
+  usage: usageSchema,
+});
+
+export const runResultSchema = z.discriminatedUnion('kind', [runOutcomeSchema, reviewOutcomeSchema, planOutcomeSchema]);
 export type RunResult = z.infer<typeof runResultSchema>;
 export type RunOutcome = z.infer<typeof runOutcomeSchema>;
 export type ReviewOutcome = z.infer<typeof reviewOutcomeSchema>;
+export type PlanOutcome = z.infer<typeof planOutcomeSchema>;
 
 export type RunEvent =
   | { type: 'text'; text: string }
@@ -59,6 +71,7 @@ export type RunRequest = {
   scratchDir: string;
   mode: RunMode;
   instructions: string; // Ticket body + failure note / feedback + skill copies
+  resumeSessionId?: string; // continue an earlier session (the Planner's)
   resultSchema: JsonSchema;
   timeoutMs: number;
   signal: AbortSignal;

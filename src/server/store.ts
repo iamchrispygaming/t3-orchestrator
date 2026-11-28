@@ -3,6 +3,9 @@ import { DatabaseSync } from 'node:sqlite';
 import type {
   Door,
   ModelTier,
+  PlanDraft,
+  PlanMessage,
+  PlanStatus,
   ReviewRecord,
   RunRecord,
   TargetRepo,
@@ -50,11 +53,43 @@ const migrations: string[] = [
      verdict TEXT,
      findings TEXT
    );`,
+  `CREATE TABLE plans (
+     id INTEGER PRIMARY KEY AUTOINCREMENT, -- never reused: a late result must not find a newer Plan
+     repo_id INTEGER NOT NULL REFERENCES target_repos(id),
+     tier TEXT NOT NULL,
+     status TEXT NOT NULL,
+     created_at TEXT NOT NULL,
+     session_id TEXT,
+     draft TEXT
+   );
+   CREATE TABLE plan_messages (
+     id INTEGER PRIMARY KEY,
+     plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+     sender TEXT NOT NULL,
+     text TEXT NOT NULL,
+     just_draft INTEGER NOT NULL DEFAULT 0,
+     round TEXT,
+     at TEXT NOT NULL
+   );
+   CREATE TABLE settings (
+     key TEXT PRIMARY KEY,
+     value TEXT NOT NULL
+   );`,
 ];
 
 type Row = Record<string, unknown>;
 
 export type StoredTicket = Ticket & { body: string };
+
+export type StoredPlan = {
+  id: number;
+  repoId: number;
+  tier: ModelTier;
+  status: PlanStatus;
+  createdAt: string;
+  sessionId: string | null;
+  draft: PlanDraft | null;
+};
 
 export class Store {
   private db: DatabaseSync;
@@ -165,6 +200,93 @@ export class Store {
       verdict: (r.verdict ?? null) as ReviewRecord['verdict'],
     }));
   }
+
+  // A new Plan and its idea, saved together so no one ever sees a Plan without its idea.
+  addPlan(plan: { repoId: number; tier: ModelTier; idea: string; createdAt: Date }): StoredPlan {
+    const at = plan.createdAt.toISOString();
+    this.db.exec('BEGIN');
+    try {
+      const { lastInsertRowid } = this.db
+        .prepare("INSERT INTO plans (repo_id, tier, status, created_at) VALUES (?, ?, 'thinking', ?)")
+        .run(plan.repoId, JSON.stringify(plan.tier), at);
+      const id = Number(lastInsertRowid);
+      this.addPlanMessage(id, { from: 'user', text: plan.idea, justDraft: false, at });
+      this.db.exec('COMMIT');
+      return this.getPlan(id)!;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  getPlan(id: number): StoredPlan | undefined {
+    const row = this.db.prepare('SELECT * FROM plans WHERE id = ?').get(id) as Row | undefined;
+    return row && toPlan(row);
+  }
+
+  listPlans(): StoredPlan[] {
+    return (this.db.prepare('SELECT * FROM plans ORDER BY id').all() as Row[]).map(toPlan);
+  }
+
+  updatePlan(id: number, change: { status?: PlanStatus; sessionId?: string; draft?: PlanDraft }): void {
+    if (change.status !== undefined) this.db.prepare('UPDATE plans SET status = ? WHERE id = ?').run(change.status, id);
+    if (change.sessionId !== undefined) this.db.prepare('UPDATE plans SET session_id = ? WHERE id = ?').run(change.sessionId, id);
+    if (change.draft !== undefined) this.db.prepare('UPDATE plans SET draft = ? WHERE id = ?').run(JSON.stringify(change.draft), id);
+  }
+
+  deletePlan(id: number): void {
+    this.db.prepare('DELETE FROM plans WHERE id = ?').run(id);
+  }
+
+  addPlanMessage(planId: number, message: PlanMessage): void {
+    this.db
+      .prepare('INSERT INTO plan_messages (plan_id, sender, text, just_draft, round, at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(
+        planId,
+        message.from,
+        message.text,
+        message.from === 'user' && message.justDraft ? 1 : 0,
+        message.from === 'planner' && message.round ? JSON.stringify(message.round) : null,
+        message.at,
+      );
+  }
+
+  listPlanMessages(planId: number): PlanMessage[] {
+    const rows = this.db.prepare('SELECT * FROM plan_messages WHERE plan_id = ? ORDER BY id').all(planId) as Row[];
+    return rows.map((r): PlanMessage =>
+      r.sender === 'user'
+        ? { from: 'user', text: String(r.text), justDraft: Number(r.just_draft) === 1, at: String(r.at) }
+        : {
+            from: 'planner',
+            text: String(r.text),
+            round: r.round == null ? null : JSON.parse(String(r.round)),
+            at: String(r.at),
+          },
+    );
+  }
+
+  getSetting(key: string): unknown {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as Row | undefined;
+    return row && JSON.parse(String(row.value));
+  }
+
+  setSetting(key: string, value: unknown): void {
+    this.db
+      .prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value')
+      .run(key, JSON.stringify(value));
+  }
+}
+
+function toPlan(row: Row): StoredPlan {
+  return {
+    id: Number(row.id),
+    repoId: Number(row.repo_id),
+    tier: JSON.parse(String(row.tier)) as ModelTier,
+    status: String(row.status) as PlanStatus,
+    createdAt: String(row.created_at),
+    sessionId: row.session_id == null ? null : String(row.session_id),
+    draft: row.draft == null ? null : (JSON.parse(String(row.draft)) as PlanDraft),
+  };
 }
 
 function toTicket(row: Row): StoredTicket {
