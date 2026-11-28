@@ -132,7 +132,7 @@ describe('the Planner interview', () => {
   });
 
   it('refuses a reply while the Planner is still thinking', async () => {
-    let finish!: () => void;
+    let finish: (() => void) | undefined;
     agent.script('plan', () => new Promise((resolve) => (finish = () => resolve(round([{ question: 'Q?', recommended: 'A.' }])))));
     const api = start();
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
@@ -140,6 +140,7 @@ describe('the Planner interview', () => {
     const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
 
     await expect(api.replyToPlan(plan.id, { text: 'Hurry up.' })).rejects.toThrow(/409/);
+    while (!finish) await new Promise((r) => setTimeout(r, 5));
     finish();
     await settled(events, plan.id);
     await events.close();
@@ -272,26 +273,121 @@ describe('the Planner interview', () => {
     expect(github.branches('acme', 'widgets')).toEqual(['main']);
   });
 
-  it('runs every Planner turn at the Planner tier setting, never a cheaper Ladder tier', async () => {
-    const sonnet = { agent: 'claude', model: 'sonnet', effort: 'high' } as const;
+  it('keeps each Plan on the Planner tier it started at; a setting change applies only to new Plans', async () => {
+    const codex = { agent: 'codex', model: 'gpt-6.2-astra', effort: 'high' } as const;
     agent
-      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]))
-      .script('plan', () => drafted(draft));
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }], { sessionId: 'claude-session' }))
+      .script('plan', () => drafted(draft, { sessionId: 'claude-session' }))
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }], { sessionId: 'codex-session' }));
     const api = start();
     expect(await api.getSettings()).toEqual({ plannerTier: opusHigh });
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const open = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, open.id);
+
+    await api.updateSettings({ plannerTier: codex });
+    await api.replyToPlan(open.id, { text: 'A.' });
+    const answered = await settled(events, open.id);
+    const fresh = await api.startPlan({ repoId: repo.id, idea: 'Wave at people.' });
+    await settled(events, fresh.id);
+    await events.close();
+
+    expect(answered.status).toBe('drafted');
+    expect(answered.tier).toEqual(opusHigh);
+    expect(agent.calls.map((c) => [c.tier, c.resumeSessionId])).toEqual([
+      [opusHigh, undefined],
+      [opusHigh, 'claude-session'],
+      [codex, undefined],
+    ]);
+    for (const server of servers.splice(0)) await server.close();
+    expect(await start().getSettings()).toEqual({ plannerTier: codex });
+  });
+
+  it("drops a discarded Plan's late Planner result instead of saving it on another Plan", async () => {
+    mkdirSync(join(root, 'second'));
+    github.addRepo('acme', 'gadgets', createBareRemote(join(root, 'second')));
+    const finish: Array<() => void> = [];
+    agent
+      .script('plan', () => new Promise((resolve) => finish.push(() => resolve(drafted(draft, { sessionId: 'widgets-session' })))))
+      .script('plan', () => new Promise((resolve) => finish.push(() => resolve(round([{ question: 'Gadget Q?', recommended: 'A.' }])))));
+    const api = start();
+    const widgets = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const gadgets = await api.addTargetRepo({ owner: 'acme', name: 'gadgets' });
+    const events = await api.events();
+    const gone = await api.startPlan({ repoId: widgets.id, idea: 'Greet people.' });
+    while (finish.length < 1) await new Promise((r) => setTimeout(r, 5));
+    await api.discardPlan(gone.id);
+    const kept = await api.startPlan({ repoId: gadgets.id, idea: 'Build a gadget.' });
+    while (finish.length < 2) await new Promise((r) => setTimeout(r, 5));
+
+    finish[0]!();
+    finish[1]!();
+    const asked = await settled(events, kept.id);
+    await events.close();
+
+    expect(asked).toMatchObject({ repoId: gadgets.id, status: 'asking', draft: null });
+    expect(asked.messages.map((m) => m.text)).toEqual(['Build a gadget.', 'A few questions first.']);
+    expect(await api.listPlans()).toEqual([asked]);
+    expect(agent.calls[1]!.resumeSessionId).toBeUndefined();
+  });
+
+  it('shows a new Plan with its idea from the start, and discarding it during setup leaves nothing behind', async () => {
+    agent.script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const starting = api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    let listed = await api.listPlans();
+    while (listed.length === 0) listed = await api.listPlans();
+    expect(listed[0]!.messages).toMatchObject([{ from: 'user', text: 'Greet people.' }]);
+
+    await api.discardPlan(listed[0]!.id);
+    await starting;
+    for (const server of servers.splice(0)) await server.close();
+
+    expect(await start().listPlans()).toEqual([]);
+    expect(existsSync(join(dataDir, 'repos', 'acme', 'widgets', 'plan', String(listed[0]!.id)))).toBe(false);
+  });
+
+  it('keeps the idea and asks round 1 when a restart lands during Plan setup', async () => {
+    let api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const starting = api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    let listed = await api.listPlans();
+    while (listed.length === 0) listed = await api.listPlans();
+    for (const server of servers.splice(0)) await server.close();
+    await starting.catch(() => undefined);
+
+    agent.script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]));
+    api = start();
+    const events = await api.events();
+    const snapshot = await events.next();
+    const pending = snapshot.type === 'snapshot' ? snapshot.plans[0] : undefined;
+    const asked = pending && pending.status !== 'thinking' ? pending : await settled(events, listed[0]!.id);
+    await events.close();
+
+    expect(asked.status).toBe('asking');
+    expect(asked.messages.map((m) => m.text)).toEqual(['Greet people.', 'A few questions first.']);
+  });
+
+  it('treats a plain "just draft it" reply like the just-draft command', async () => {
+    agent
+      .script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }]))
+      .script('plan', () => round([{ question: 'One more?', recommended: 'No.' }], { draft }));
+    const api = start();
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
     const events = await api.events();
     const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
     await settled(events, plan.id);
 
-    await api.updateSettings({ plannerTier: sonnet });
-    await api.replyToPlan(plan.id, { text: 'A.' });
-    await settled(events, plan.id);
+    await api.replyToPlan(plan.id, { text: '  Just Draft It.  ' });
+    const after = await settled(events, plan.id);
     await events.close();
 
-    expect(agent.calls.map((c) => c.tier)).toEqual([opusHigh, sonnet]);
-    for (const server of servers.splice(0)) await server.close();
-    expect(await start().getSettings()).toEqual({ plannerTier: sonnet });
+    expect(after.messages.at(-2)).toMatchObject({ from: 'user', justDraft: true });
+    expect(agent.calls[1]!.instructions).toMatch(/ask no more questions/i);
+    expect(after.status).toBe('failed');
+    expect(after.messages.filter((m) => m.from === 'planner' && m.round)).toHaveLength(1);
   });
 
   it('marks a turn failed when the Planner crashes, and a reply retries it', async () => {

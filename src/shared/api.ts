@@ -115,6 +115,7 @@ export type PlanStatus = z.infer<typeof planStatusSchema>;
 export const planSchema = z.object({
   id: z.number().int(),
   repoId: z.number().int(),
+  tier: modelTierSchema, // the Planner tier this Plan started at; its session stays on it
   status: planStatusSchema,
   createdAt: z.iso.datetime(),
   draft: planDraftSchema.nullable(),

@@ -54,8 +54,9 @@ const migrations: string[] = [
      findings TEXT
    );`,
   `CREATE TABLE plans (
-     id INTEGER PRIMARY KEY,
+     id INTEGER PRIMARY KEY AUTOINCREMENT, -- never reused: a late result must not find a newer Plan
      repo_id INTEGER NOT NULL REFERENCES target_repos(id),
+     tier TEXT NOT NULL,
      status TEXT NOT NULL,
      created_at TEXT NOT NULL,
      session_id TEXT,
@@ -83,6 +84,7 @@ export type StoredTicket = Ticket & { body: string };
 export type StoredPlan = {
   id: number;
   repoId: number;
+  tier: ModelTier;
   status: PlanStatus;
   createdAt: string;
   sessionId: string | null;
@@ -199,11 +201,22 @@ export class Store {
     }));
   }
 
-  addPlan(repoId: number, createdAt: Date): StoredPlan {
-    const { lastInsertRowid } = this.db
-      .prepare("INSERT INTO plans (repo_id, status, created_at) VALUES (?, 'thinking', ?)")
-      .run(repoId, createdAt.toISOString());
-    return this.getPlan(Number(lastInsertRowid))!;
+  // A new Plan and its idea, saved together so no one ever sees a Plan without its idea.
+  addPlan(plan: { repoId: number; tier: ModelTier; idea: string; createdAt: Date }): StoredPlan {
+    const at = plan.createdAt.toISOString();
+    this.db.exec('BEGIN');
+    try {
+      const { lastInsertRowid } = this.db
+        .prepare("INSERT INTO plans (repo_id, tier, status, created_at) VALUES (?, ?, 'thinking', ?)")
+        .run(plan.repoId, JSON.stringify(plan.tier), at);
+      const id = Number(lastInsertRowid);
+      this.addPlanMessage(id, { from: 'user', text: plan.idea, justDraft: false, at });
+      this.db.exec('COMMIT');
+      return this.getPlan(id)!;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   getPlan(id: number): StoredPlan | undefined {
@@ -268,6 +281,7 @@ function toPlan(row: Row): StoredPlan {
   return {
     id: Number(row.id),
     repoId: Number(row.repo_id),
+    tier: JSON.parse(String(row.tier)) as ModelTier,
     status: String(row.status) as PlanStatus,
     createdAt: String(row.created_at),
     sessionId: row.session_id == null ? null : String(row.session_id),

@@ -2,6 +2,7 @@
 // read-only on a fresh checkout of the Target Repo's default branch. It interviews
 // the user in numbered rounds and keeps a structured Plan draft, all held locally
 // until the Plan is approved (#38) or discarded.
+import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import {
   modelTierSchema,
@@ -51,6 +52,11 @@ const INTERVIEW_RULES = `You are the Planner. Read the Target Repo in your worki
 Interview the user in rounds: each round is a short list of questions, each with your recommended answer, so the user can reply "yes" or in their own words. Keep going until you share an understanding, then stop asking.
 With every reply, return the whole current Plan draft as far as you can write it: a Spec, its Tickets, the blocking edges between them (blockedBy, by Ticket key), each Ticket's Model Tier with a one-line reason, and whether each Ticket is expected to be one-way or two-way. Return no draft only while you know too little to write one.`;
 
+// "just draft it" typed as a plain reply counts as the command.
+function isJustDraft(text: string | undefined): boolean {
+  return /^just draft it[.!]*$/i.test((text ?? '').trim());
+}
+
 const JUST_DRAFT = 'The user says: just draft it. Ask no more questions: return no questions and the complete Plan draft now.';
 
 export class Planner {
@@ -92,14 +98,8 @@ export class Planner {
     const { store, clock } = this.deps;
     const repo = store.getTargetRepo(req.repoId);
     if (!repo) throw new PlanNotFound(`no Target Repo ${req.repoId}`);
-    const plan = store.addPlan(repo.id, clock.now());
-    try {
-      await this.workspace(repo).preparePlannerCheckout(plan.id, repo.defaultBranch);
-    } catch (error) {
-      store.deletePlan(plan.id);
-      throw error;
-    }
-    store.addPlanMessage(plan.id, { from: 'user', text: req.idea, justDraft: false, at: clock.now().toISOString() });
+    // The tier is fixed per Plan: a resumed session never moves to another Agent or model.
+    const plan = store.addPlan({ repoId: repo.id, tier: this.plannerTier(), idea: req.idea, createdAt: clock.now() });
     this.emit(plan.id);
     this.track(this.turn(plan.id));
     return this.plan(plan.id);
@@ -110,7 +110,7 @@ export class Planner {
     const plan = store.getPlan(id);
     if (!plan) throw new PlanNotFound(`no Plan ${id}`);
     if (plan.status === 'thinking') throw new PlanBusy(`Plan ${id} is waiting on the Planner`);
-    const justDraft = req.justDraft === true;
+    const justDraft = req.justDraft === true || isJustDraft(req.text);
     store.addPlanMessage(id, { from: 'user', text: req.text ?? 'Just draft it.', justDraft, at: clock.now().toISOString() });
     store.updatePlan(id, { status: 'thinking' });
     this.emit(id);
@@ -165,11 +165,16 @@ export class Planner {
 
   private async turn(id: number): Promise<void> {
     const { store, clock } = this.deps;
+    const repoId = store.getPlan(id)?.repoId;
     const abort = new AbortController();
     this.aborts.set(id, abort);
+    // A discard aborts the turn; ids are never reused, so this also guards a later Plan.
+    const cancelled = () => abort.signal.aborted || this.stopping.signal.aborted || !store.getPlan(id);
     try {
+      await this.prepareCheckout(id);
+      if (cancelled()) return;
       const result = await this.ask(id, abort.signal);
-      if (!store.getPlan(id)) return; // discarded meanwhile
+      if (cancelled()) return; // drop a late result: nothing is saved for a cancelled turn
       const roundsSoFar = store.listPlanMessages(id).filter((m) => m.from === 'planner' && m.round).length;
       const round = result.questions.length > 0 ? { number: roundsSoFar + 1, questions: result.questions } : null;
       store.addPlanMessage(id, { from: 'planner', text: result.message, round, at: clock.now().toISOString() });
@@ -189,7 +194,26 @@ export class Planner {
       this.emit(id);
     } finally {
       if (this.aborts.get(id) === abort) this.aborts.delete(id);
+      // A discard during setup can race the checkout into existence again; clear it here.
+      if (!store.getPlan(id)) await this.removeCheckout(repoId, id).catch((error) => this.deps.log('Planner checkout cleanup failed', error));
     }
+  }
+
+  // The first turn reads a fresh checkout (redone if a stop cut setup short); later turns reuse it.
+  private async prepareCheckout(id: number): Promise<void> {
+    const plan = this.deps.store.getPlan(id);
+    if (!plan) return;
+    const repo = this.deps.store.getTargetRepo(plan.repoId)!;
+    const workspace = this.workspace(repo);
+    if (plan.sessionId && existsSync(workspace.plannerFolders(id).worktree)) return;
+    await workspace.removePlannerCheckout(id);
+    await workspace.preparePlannerCheckout(id, repo.defaultBranch);
+  }
+
+  private async removeCheckout(repoId: number | undefined, id: number): Promise<void> {
+    if (repoId === undefined) return;
+    const repo = this.deps.store.getTargetRepo(repoId);
+    if (repo) await this.workspace(repo).removePlannerCheckout(id);
   }
 
   private async ask(id: number, signal: AbortSignal): Promise<PlanOutcome> {
@@ -207,7 +231,7 @@ export class Planner {
     const folders = this.workspace(repo).plannerFolders(id);
 
     const events = this.deps.agentRunner.start({
-      tier: this.plannerTier(),
+      tier: plan.tier,
       cwd: folders.worktree,
       scratchDir: folders.scratch,
       mode: 'plan',
