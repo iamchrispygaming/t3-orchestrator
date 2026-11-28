@@ -4,7 +4,6 @@ import type { ModelTier, Ticket, TicketState } from '../shared/api.ts';
 
 export const STATE_LABELS: Record<TicketState, string> = {
   waiting: 'Waiting',
-  waiting: 'Blocked',
   ready: 'Up next',
   running: 'Running',
   reviewing: 'In review',
@@ -12,7 +11,6 @@ export const STATE_LABELS: Record<TicketState, string> = {
 };
 
 export const STATE_STYLES: Record<TicketState, string> = {
-  waiting: 'text-amber-300 bg-amber-400/10',
   waiting: 'text-amber-300 bg-amber-400/10',
   ready: 'text-zinc-400 bg-white/5',
   running: 'text-green-400 bg-green-500/10',

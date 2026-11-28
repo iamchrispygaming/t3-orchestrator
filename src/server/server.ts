@@ -130,7 +130,8 @@ export function createServer(deps: ServerDeps): Server {
     if (!ticket) return c.json({ error: `no Ticket ${id}` }, 404);
     const detail: TicketDetail = {
       ...ticket,
-      runs: store.listRuns(id), reviews: store.listReviews(id),
+      runs: store.listRuns(id),
+      reviews: store.listReviews(id),
       output: engine.output(id),
     };
     return c.json(detail);
