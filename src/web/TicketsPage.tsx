@@ -1,7 +1,9 @@
 // The Tickets page: a card grid, cards needing the user first.
-import type { Ticket } from '../shared/api.ts';
+import { useEffect, useRef, useState } from 'react';
+import { agentSchema, ticketStateSchema, type ListTicketsQuery, type Ticket } from '../shared/api.ts';
 import { AgentIcon, Icon } from './icons.tsx';
-import { actionsFor, cardOrder, needsYou, prUrl, STATE_LABELS, STATE_STYLES, tierLabel } from './tickets.ts';
+import { api } from './live.ts';
+import { actionsFor, AGENT_NAMES, cardOrder, needsYou, prUrl, STATE_LABELS, STATE_STYLES, tierLabel } from './tickets.ts';
 
 export function StatusPill({ ticket }: { ticket: Ticket }) {
   return (
@@ -109,6 +111,69 @@ function TicketCard({
   );
 }
 
+type TicketResults = { tickets: Ticket[]; failed?: boolean };
+
+function useTicketResults(
+  query: ListTicketsQuery,
+  active: boolean,
+  tickets: Ticket[],
+  output: ReadonlyMap<number, string[]>,
+): TicketResults | undefined {
+  const [results, setResults] = useState<TicketResults & { query: ListTicketsQuery }>();
+  const refresh = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    if (!active) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let running = false;
+    let pending = false;
+
+    function schedule() {
+      if (controller.signal.aborted || timer !== undefined) return;
+      if (running) {
+        pending = true;
+        return;
+      }
+      // Coalesce SSE bursts and typing without waiting for live output to stop.
+      timer = setTimeout(load, 250);
+    }
+
+    async function load() {
+      timer = undefined;
+      running = true;
+      try {
+        const tickets = await api.listTickets(query, controller.signal);
+        if (!controller.signal.aborted) setResults({ query, tickets });
+      } catch {
+        if (!controller.signal.aborted) setResults({ query, tickets: [], failed: true });
+      } finally {
+        running = false;
+        if (pending) {
+          pending = false;
+          schedule();
+        }
+      }
+    }
+
+    refresh.current = schedule;
+    schedule();
+    return () => {
+      refresh.current = () => {};
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [active, query]);
+
+  useEffect(() => refresh.current(), [tickets]);
+  useEffect(() => {
+    if (query.q?.trim()) refresh.current();
+  }, [output, query.q]);
+
+  if (!active) return { tickets };
+  return results?.query === query ? results : undefined;
+}
+
 export function TicketsPage({
   tickets,
   output,
@@ -120,27 +185,85 @@ export function TicketsPage({
   selectedId: number | null;
   onOpen: (id: number) => void;
 }) {
-  if (tickets.length === 0) {
-    return (
-      <div className="grid h-full place-items-center text-center text-mute">
-        <div>
-          <div className="text-base font-semibold text-zinc-300">No Tickets yet</div>
-          <div className="mt-1 text-sm">Tickets appear here once a Plan is approved.</div>
-        </div>
-      </div>
-    );
-  }
+  const [query, setQuery] = useState<ListTicketsQuery>({});
+  const filtered = Boolean(query.state || query.agent || query.repoId || query.q?.trim());
+  const results = useTicketResults(query, filtered, tickets, output);
+  const projects = [...new Map(tickets.map((ticket) => [ticket.repoId, ticket.repo]))]
+    .sort(([, a], [, b]) => a.localeCompare(b));
+  const field = 'rounded-md border border-line2 bg-panel px-3 py-2 text-sm text-zinc-200';
+
   return (
-    <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4.5">
-      {cardOrder(tickets).map((ticket) => (
-        <TicketCard
-          key={ticket.id}
-          ticket={ticket}
-          lines={output.get(ticket.id) ?? []}
-          selected={ticket.id === selectedId}
-          onOpen={() => onOpen(ticket.id)}
+    <>
+      <div className="mb-5 flex flex-wrap gap-3">
+        <input
+          type="search"
+          aria-label="Search Tickets, PRs and Agent output"
+          placeholder="Search Tickets, PRs and Agent output"
+          className={`${field} min-w-56 flex-1`}
+          value={query.q ?? ''}
+          onChange={(event) => {
+            const q = event.currentTarget.value;
+            setQuery((previous) => ({ ...previous, q }));
+          }}
         />
-      ))}
-    </div>
+        <select
+          aria-label="Status"
+          className={field}
+          value={query.state ?? ''}
+          onChange={(event) => {
+            const state = ticketStateSchema.safeParse(event.currentTarget.value).data;
+            setQuery((previous) => ({ ...previous, state }));
+          }}
+        >
+          <option value="">All statuses</option>
+          {ticketStateSchema.options.map((state) => <option key={state} value={state}>{STATE_LABELS[state]}</option>)}
+        </select>
+        <select
+          aria-label="Agent"
+          className={field}
+          value={query.agent ?? ''}
+          onChange={(event) => {
+            const agent = agentSchema.safeParse(event.currentTarget.value).data;
+            setQuery((previous) => ({ ...previous, agent }));
+          }}
+        >
+          <option value="">All Agents</option>
+          {agentSchema.options.map((agent) => <option key={agent} value={agent}>{AGENT_NAMES[agent]}</option>)}
+        </select>
+        <select
+          aria-label="Project"
+          className={field}
+          value={query.repoId ?? ''}
+          onChange={(event) => {
+            const repoId = Number(event.currentTarget.value) || undefined;
+            setQuery((previous) => ({ ...previous, repoId }));
+          }}
+        >
+          <option value="">All projects</option>
+          {projects.map(([id, repo]) => <option key={id} value={id}>{repo}</option>)}
+        </select>
+      </div>
+      {!results ? (
+        <p role="status" className="text-sm text-mute">Loading Tickets…</p>
+      ) : results.failed ? (
+        <p role="alert" className="text-sm text-red-400">Couldn’t load Tickets.</p>
+      ) : results.tickets.length === 0 ? (
+        <p role="status" className="py-8 text-center text-mute">
+          {filtered ? 'No Tickets match your search or filters.' : 'Tickets appear here once a Plan is approved.'}
+        </p>
+      ) : (
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(300px,1fr))] gap-4.5">
+          {cardOrder(results.tickets).map((ticket) => (
+            <TicketCard
+              key={ticket.id}
+              ticket={ticket}
+              lines={output.get(ticket.id) ?? []}
+              selected={ticket.id === selectedId}
+              onOpen={() => onOpen(ticket.id)}
+            />
+          ))}
+        </div>
+      )}
+    </>
   );
 }

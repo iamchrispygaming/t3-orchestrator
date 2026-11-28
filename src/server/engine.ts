@@ -14,6 +14,7 @@ import {
   type ApprovedPlan,
   type Door,
   type EscalationSettings,
+  type ListTicketsQuery,
   type ModelTier,
   type ParallelLimits,
   type PlanDraft,
@@ -159,6 +160,25 @@ export class Engine {
 
   tickets(): Ticket[] {
     return this.deps.store.listTickets().map(publicTicket);
+  }
+
+  async listTickets({ state, agent, repoId, q }: ListTicketsQuery): Promise<Ticket[]> {
+    const tickets = this.tickets().filter((ticket) =>
+      (state === undefined || ticket.state === state) &&
+      (agent === undefined || ticket.tier.agent === agent) &&
+      (repoId === undefined || ticket.repoId === repoId)
+    );
+    const term = q?.toLowerCase();
+    if (!term) return tickets;
+
+    const matches = (text: string) => text.toLowerCase().includes(term);
+    const matching = await Promise.all(tickets.map(async (ticket) => {
+      if (matches(ticket.title) || this.outputs.get(ticket.id)?.some(matches)) return true;
+      if (ticket.prNumber === null) return false;
+      const [owner, name] = ticket.repo.split('/') as [string, string];
+      return matches(await this.deps.github.getPullRequestTitle(owner, name, ticket.prNumber));
+    }));
+    return tickets.filter((_, index) => matching[index]);
   }
 
   targetRepos(): TargetRepo[] {

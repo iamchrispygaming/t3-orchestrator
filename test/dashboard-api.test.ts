@@ -7,9 +7,10 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { createServer, type Server } from '../src/server/server.ts';
 import type { ModelTier, ServerEvent, TicketDetail } from '../src/shared/api.ts';
 import { createApiClient, type EventStream } from '../src/web/api.ts';
-import { approve, done, FakeAgentRunner } from './support/fake-agent-runner.ts';
+import { approve, done, FakeAgentRunner, hang } from './support/fake-agent-runner.ts';
 import { FakeClock } from './support/fake-clock.ts';
 import { FakeGitHub } from './support/fake-github.ts';
+import { FakeNotifier } from './support/fake-notifier.ts';
 import { commitFile, createBareRemote } from './support/git.ts';
 
 const tier: ModelTier = { agent: 'claude', model: 'haiku', effort: 'medium' };
@@ -40,6 +41,7 @@ describe('the dashboard API', () => {
       github,
       agentRunner: agent,
       clock: new FakeClock(),
+      notifier: new FakeNotifier(),
       log: () => {},
       ...extra,
     });
@@ -54,6 +56,56 @@ describe('the dashboard API', () => {
       if (match(event)) return event;
     }
   }
+
+  async function matchingIds(request: ReturnType<typeof start>['request'], query = '') {
+    const response = await request(`/api/tickets${query}`);
+    expect(response.status).toBe(200);
+    return (await response.json() as { id: number }[]).map(({ id }) => id);
+  }
+
+  it('filters by status, current Agent and Target Repo, separately and together', async () => {
+    github.addRepo('acme', 'gadgets', join(root, 'remote.git'));
+    for (const name of ['widgets', 'gadgets']) {
+      github.addIssue('acme', name, { number: 10, title: 'Blocker', body: '' });
+      github.addIssue('acme', name, { number: 8, title: 'Blocked', body: '', blockedBy: [10] });
+    }
+    agent.script('run', hang);
+    const { api, request } = start();
+    const widgets = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const gadgets = await api.addTargetRepo({ owner: 'acme', name: 'gadgets' });
+    const events = await api.events();
+    const running = await api.registerTicket({ repoId: widgets.id, issueNumber: 7, tier, door: 'two-way' });
+    const waiting = await api.registerTicket({ repoId: widgets.id, issueNumber: 8, tier, door: 'two-way' });
+    const other = await api.registerTicket({
+      repoId: gadgets.id, issueNumber: 8, tier: { ...tier, agent: 'codex' }, door: 'two-way',
+    });
+    await nextMatching(events, (e): e is Extract<ServerEvent, { type: 'output' }> => e.type === 'output');
+    await events.close();
+
+    expect(await matchingIds(request)).toEqual([running.id, waiting.id, other.id]);
+    expect(await matchingIds(request, '?state=waiting')).toEqual([waiting.id, other.id]);
+    expect(await matchingIds(request, '?agent=codex')).toEqual([other.id]);
+    expect(await matchingIds(request, `?repoId=${widgets.id}`)).toEqual([running.id, waiting.id]);
+    expect(await matchingIds(request, `?state=waiting&agent=claude&repoId=${widgets.id}`)).toEqual([waiting.id]);
+  });
+
+  it('searches Ticket titles across Target Repos and combines search with filters', async () => {
+    github.addRepo('acme', 'gadgets', join(root, 'remote.git'));
+    github.addIssue('acme', 'gadgets', { number: 7, title: 'Polish the greeting file', body: '' });
+    github.addIssue('acme', 'gadgets', { number: 8, title: 'Add a footer', body: '' });
+    agent.otherwise('run', hang);
+    const { api, request } = start();
+    const widgets = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const gadgets = await api.addTargetRepo({ owner: 'acme', name: 'gadgets' });
+    const first = await api.registerTicket({ repoId: widgets.id, issueNumber: 7, tier, door: 'two-way' });
+    const second = await api.registerTicket({ repoId: gadgets.id, issueNumber: 7, tier, door: 'two-way' });
+    const third = await api.registerTicket({ repoId: gadgets.id, issueNumber: 8, tier, door: 'two-way' });
+
+    expect(await matchingIds(request, '?q=%20GREETING+file%20')).toEqual([first.id, second.id]);
+    expect(await matchingIds(request, `?q=greeting&repoId=${gadgets.id}`)).toEqual([second.id]);
+    expect(await matchingIds(request, '?q=%20')).toEqual([first.id, second.id, third.id]);
+    expect(await matchingIds(request, '?q=missing')).toEqual([]);
+  });
 
   it("streams the running Agent's output lines over SSE, tagged with the Ticket", async () => {
     agent.script('run', (req) => {
@@ -166,6 +218,34 @@ describe('the dashboard API', () => {
     const ticket = await runToMerged(api);
 
     expect((await api.getTicket(ticket.id)).output).toEqual(['fake run started', 'fake review started']);
+  });
+
+  it('finds a completed Ticket by its retained Agent output', async () => {
+    agent.script('run', (req) => {
+      commitFile(req.cwd, 'hello.txt', 'hello\n', 'Add hello.txt');
+      return done();
+    });
+    agent.script('review', () => approve());
+    const { api, request } = start();
+
+    const ticket = await runToMerged(api);
+
+    expect(await matchingIds(request, '?q=REVIEW+started&state=merged')).toEqual([ticket.id]);
+  });
+
+  it('finds a Ticket by its PR title after it is renamed on GitHub', async () => {
+    agent.script('run', (req) => {
+      commitFile(req.cwd, 'hello.txt', 'hello\n', 'Add hello.txt');
+      return done();
+    });
+    agent.script('review', () => approve());
+    const { api, request } = start();
+
+    const ticket = await runToMerged(api);
+    const [pr] = github.pulls('acme', 'widgets');
+    github.renamePullRequest('acme', 'widgets', pr!.number, 'Introduce a Salutation');
+
+    expect(await matchingIds(request, '?q=salutation')).toEqual([ticket.id]);
   });
 
   it('says in the Run history why a Run failed', async () => {

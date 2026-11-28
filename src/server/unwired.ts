@@ -16,6 +16,7 @@ export const unwiredGitHub: GitHub = {
   createIssue: refuse('GitHub'),
   addSubIssue: refuse('GitHub'),
   addBlocker: refuse('GitHub'),
+  getPullRequestTitle: refuse('GitHub'),
   createPullRequest: refuse('GitHub'),
   updatePullRequest: refuse('GitHub'),
   markPullRequestReady: refuse('GitHub'),

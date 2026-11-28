@@ -23,6 +23,7 @@ export interface GitHub {
   addBlocker(blocked: IssueRef, blocker: IssueRef): Promise<void>;
   // The issues blocking this one (native GitHub issue dependencies, same repo).
   getBlockers(owner: string, name: string, number: number): Promise<Blocker[]>;
+  getPullRequestTitle(owner: string, name: string, number: number): Promise<string>;
   createPullRequest(owner: string, name: string, pr: NewPullRequest): Promise<{ number: number }>;
   updatePullRequest(owner: string, name: string, number: number, change: { body: string }): Promise<void>;
   markPullRequestReady(owner: string, name: string, number: number): Promise<void>;
