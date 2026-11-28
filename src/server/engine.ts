@@ -4,9 +4,10 @@
 // Waiting -> Ready when every blocker is Merged; Ready -> Running when the
 // Ticket's Agent has a free slot, in queue order; then Running -> Reviewing ->
 // Merged, and Escalation (a failed Run goes back to Ready one Model Tier up;
-// failing at the top is a Handback). Every other branch of the state machine
-// stops with NotYetHandled until the ticket that builds it lands (Review #27,
-// doors #28, Handback actions #30, ...).
+// failing at the top is a Handback), and Awaiting merge for a One-way Ticket.
+// Polling GitHub adds merges made on GitHub and `model:*` / `door:*` label
+// edits. Every other branch of the state machine stops with NotYetHandled until
+// the ticket that builds it lands (Review #27, doors #28, Handback actions #30, ...).
 import { z } from 'zod';
 import {
   escalationSettingsSchema,
@@ -35,7 +36,8 @@ import {
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import { deleteRunLogs } from './data-folder.ts';
-import type { FailedJob, GitHub, IssueRef, NewIssue } from './github.ts';
+import type { FailedJob, GitHub, IssueRef, NewIssue, RepoSnapshot } from './github.ts';
+import { doorFromLabels, tierFromLabels } from './labels.ts';
 import { DEFAULT_ESCALATION_SETTINGS, nextTier, tierLabel } from './ladder.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
@@ -85,6 +87,9 @@ type RunEnd =
 function mostCautious(...calls: Call[]): Door {
   return calls.every((c) => c === 'two-way') ? 'two-way' : 'one-way';
 }
+
+const sameTier = (a: ModelTier, b: ModelTier) =>
+  a.agent === b.agent && a.model === b.model && a.effort === b.effort;
 
 export function branchName(issueNumber: number, title: string): string {
   const slug = title
@@ -136,6 +141,16 @@ export class Engine {
   // Agent returns, not while the Orchestrator pushes, opens the PR and waits on CI.
   private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
   private repoLocks = new Map<string, Promise<void>>();
+  // Per Ticket: how many times a poll has observed its issue's labels, changed or
+  // not. A first-Run label read that a poll overtook is older than what is stored.
+  private labelObservations = new Map<number, number>();
+  // Worktrees prepared for a first Run that went back to Ready before starting:
+  // reused as they are, so nothing left in them is lost.
+  private preparedWorktrees = new Map<number, TicketFolders>();
+  // Approved Tickets every Agent called Two-way, whose fresh label read and stored
+  // door disagreed: re-decided after each poll of their repo, by PR number.
+  private pendingMerges = new Map<number, number>();
+  private decidingMerge = new Set<number>();
   private deps: EngineDeps;
 
   constructor(deps: EngineDeps) {
@@ -312,6 +327,111 @@ export class Engine {
     return { ...plan, tickets };
   }
 
+  // Applies one read of a Target Repo from GitHub to its Tickets. Matched by
+  // repo and issue number together: Target Repos can share issue numbers.
+  reconcile(repoId: number, snapshot: RepoSnapshot): void {
+    const { store } = this.deps;
+    for (const ticket of store.listTickets().filter((t) => t.repoId === repoId)) {
+      if (ticket.state === 'merged') continue;
+      const pr = this.trackedPullRequest(ticket, snapshot);
+      if (pr?.state === 'merged') {
+        this.track(this.merged(ticket));
+        continue;
+      }
+      const issue = snapshot.issues.find((i) => i.number === ticket.issueNumber);
+      if (!issue) continue;
+      // Its own work also reads the labels fresh before the first Run and before merge.
+      this.labelObservations.set(ticket.id, (this.labelObservations.get(ticket.id) ?? 0) + 1);
+      this.applyLabels(ticket, { door: doorFromLabels(issue.labels), tier: tierFromLabels(issue.labels) });
+    }
+    this.schedule();
+  }
+
+  // Called after every poll of a Target Repo, changed or not: re-decides the merges
+  // waiting for its labels to settle.
+  polled(repoId: number): void {
+    for (const [id, prNumber] of this.pendingMerges) {
+      if (this.deps.store.getTicket(id)?.repoId === repoId) this.track(this.decideMerge(id, prNumber));
+    }
+  }
+
+  // The Ticket's PR in a snapshot: by its recorded number, or, until one is recorded
+  // (the PR may merge while the Orchestrator is still creating it), by its branch,
+  // whose PR number is then recorded. Never by branch once the number is known, so
+  // another PR from the same branch can't stand in for it.
+  private trackedPullRequest(ticket: StoredTicket, snapshot: RepoSnapshot): RepoSnapshot['pullRequests'][number] | undefined {
+    if (ticket.prNumber != null) return snapshot.pullRequests.find((p) => p.number === ticket.prNumber);
+    const byBranch = snapshot.pullRequests.filter((p) => p.head === ticket.branch);
+    const pr = byBranch.find((p) => p.state === 'merged') ?? byBranch[0];
+    if (pr) {
+      this.deps.store.updateTicket(ticket.id, { prNumber: pr.number });
+      this.emit(ticket.id);
+    }
+    return pr;
+  }
+
+  // A door label edited before merge replaces the planned door. A model label edited
+  // before the first Run re-routes the Ticket; after it, Escalation owns the tier.
+  private applyLabels(ticket: StoredTicket, read: { door: Door | null; tier: ModelTier | null }): StoredTicket {
+    const { store } = this.deps;
+    const change: { door?: Door; tier?: ModelTier } = {};
+    const { door, tier } = read;
+    if (door && door !== ticket.door) change.door = door;
+    if (tier && !sameTier(tier, ticket.tier) && store.listRuns(ticket.id).length === 0) change.tier = tier;
+    if (!change.door && !change.tier) return ticket;
+    store.updateTicket(ticket.id, change);
+    this.emit(ticket.id);
+    return store.getTicket(ticket.id)!;
+  }
+
+  // Polls can be up to an interval old, so the first Run's tier comes from a fresh
+  // label read (the auto-merge reads its own; see decideMerge).
+  private async refreshLabels(id: number): Promise<StoredTicket> {
+    const { store, github } = this.deps;
+    const ticket = store.getTicket(id)!;
+    const repo = store.getTargetRepo(ticket.repoId)!;
+    const observedBefore = this.labelObservations.get(id) ?? 0;
+    const { labels } = await github.getIssue(repo.owner, repo.name, ticket.issueNumber);
+    // A poll observed the labels after this read started, even if it changed nothing:
+    // what it stored is the newer answer, so this read is dropped.
+    if ((this.labelObservations.get(id) ?? 0) !== observedBefore) return store.getTicket(id)!;
+    this.labelObservations.set(id, observedBefore + 1);
+    return this.applyLabels(store.getTicket(id)!, { door: doorFromLabels(labels), tier: tierFromLabels(labels) });
+  }
+
+  // Auto-merges a Ticket every Agent called Two-way only when a fresh label read and
+  // the stored door both say two-way. Both one-way: the merge Checkpoint. Any
+  // disagreement, in either direction: no merge now; decide again after the next poll.
+  private async decideMerge(id: number, prNumber: number): Promise<void> {
+    if (this.decidingMerge.has(id)) return;
+    this.decidingMerge.add(id);
+    try {
+      const { store, github } = this.deps;
+      const ticket = store.getTicket(id)!;
+      const repo = store.getTargetRepo(ticket.repoId)!;
+      if (ticket.state === 'merged') return void this.pendingMerges.delete(id);
+      const { labels } = await github.getIssue(repo.owner, repo.name, ticket.issueNumber);
+      const stored = store.getTicket(id)!;
+      if (stored.state === 'merged') return void this.pendingMerges.delete(id);
+      // No door label on the issue: the planned door stands.
+      const fresh = doorFromLabels(labels) ?? stored.door;
+      if (fresh !== stored.door) {
+        this.pendingMerges.set(id, prNumber);
+        return;
+      }
+      this.pendingMerges.delete(id);
+      if (stored.door !== 'two-way') {
+        // The merge Checkpoint (#28 adds the notification and fallbacks).
+        this.setState(id, 'awaiting-merge');
+        return;
+      }
+      await github.mergePullRequest(repo.owner, repo.name, prNumber, 'squash');
+      await this.merged(stored);
+    } finally {
+      this.decidingMerge.delete(id);
+    }
+  }
+
   parallelLimits(): ParallelLimits {
     return this.deps.store.parallelLimits();
   }
@@ -368,6 +488,8 @@ export class Engine {
   }
 
   private setState(id: number, state: TicketState): void {
+    // A Ticket merged on GitHub stays Merged, whatever its in-flight work does next.
+    if (this.deps.store.getTicket(id)!.state === 'merged') return;
     this.deps.store.updateTicket(id, { state });
     this.emit(id);
   }
@@ -393,6 +515,13 @@ export class Engine {
     }
   }
 
+  // Takes one of the Agent's slots if it has one free.
+  private takeSlot(agent: Agent): boolean {
+    if (this.slotsInUse[agent] >= this.deps.store.parallelLimits()[agent]) return false;
+    this.slotsInUse[agent]++;
+    return true;
+  }
+
   private freeSlot(agent: Agent): void {
     this.slotsInUse[agent]--;
     this.schedule();
@@ -403,6 +532,7 @@ export class Engine {
   // Ticket's blockers from GitHub, the same evidence registration uses.
   private async merged(ticket: StoredTicket): Promise<void> {
     const { store, github } = this.deps;
+    if (store.getTicket(ticket.id)!.state === 'merged') return;
     this.setState(ticket.id, 'merged');
     for (const waiting of store.waitingTickets()) {
       try {
@@ -479,7 +609,9 @@ export class Engine {
   // Orchestrator pushes, opens the PR and waits on CI.
   private async run(id: number, repo: TargetRepo): Promise<RunEnd> {
     const { store, github, clock, log } = this.deps;
-    const ticket = store.getTicket(id)!;
+    const firstRun = store.listRuns(id).length === 0;
+    let ticket = store.getTicket(id)!;
+    let slotAgent = ticket.tier.agent;
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
     const { runTimeLimitMinutes } = this.settings();
 
@@ -488,17 +620,36 @@ export class Engine {
     let agentEnd: AgentEnd<RunOutcome>;
     try {
       try {
-        folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
+        // A worktree kept from a start that went back to Ready is reused as it is.
+        folders =
+          this.preparedWorktrees.get(id) ??
+          (await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch));
+        this.preparedWorktrees.delete(id);
       } catch (error) {
         log('Could not prepare the worktree', error);
         return { kind: 'not-a-failure' };
+      }
+      if (firstRun) {
+        // The tier is decided only now, so an edit made during worktree setup still counts.
+        ticket = await this.refreshLabels(id);
+        if (ticket.tier.agent !== slotAgent) {
+          // Re-routed to the other Agent: switch to one of its slots, or wait Ready for
+          // one, keeping the prepared worktree.
+          if (!this.takeSlot(ticket.tier.agent)) {
+            this.preparedWorktrees.set(id, folders);
+            return { kind: 'not-a-failure' };
+          }
+          const previous = slotAgent;
+          slotAgent = ticket.tier.agent;
+          this.freeSlot(previous);
+        }
       }
       const instructions = runInstructions(ticket, store.lastFailureNote(id));
       runId = store.startRun(id, ticket.tier, clock.now());
       this.emit(id);
       agentEnd = await this.runAgent('run', id, ticket.tier, folders, runOutcomeSchema, instructions, runTimeLimitMinutes);
     } finally {
-      this.freeSlot(ticket.tier.agent);
+      this.freeSlot(slotAgent);
     }
     const endedAt = clock.now();
     if (agentEnd.kind === 'stopped') return { kind: 'stopped' };
@@ -649,9 +800,13 @@ export class Engine {
     this.emit(id);
     if (review.verdict !== 'approve') throw new NotYetHandled(`Review verdict ${review.verdict}`);
 
-    if (mostCautious(ticket.door, run.door, review.door) !== 'two-way') throw new NotYetHandled('One-way Ticket');
-    await github.mergePullRequest(repo.owner, repo.name, prNumber, 'squash');
-    await this.merged(ticket);
+    if (store.getTicket(id)!.state === 'merged') return;
+    if (mostCautious(run.door, review.door) !== 'two-way') {
+      // An Agent or the reviewer called it one-way: the merge Checkpoint, whatever the labels say.
+      this.setState(id, 'awaiting-merge');
+      return;
+    }
+    await this.decideMerge(id, prNumber);
   }
 
   // Runs the Agent until its result, a crash, a quota hit, the time limit on the

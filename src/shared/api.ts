@@ -15,7 +15,7 @@ export type Door = z.infer<typeof doorSchema>;
 export const agentSchema = modelTierSchema.shape.agent;
 export type Agent = z.infer<typeof agentSchema>;
 
-export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'handback']);
+export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'awaiting-merge', 'merged', 'handback']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
 // A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is

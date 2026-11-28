@@ -23,6 +23,8 @@ export const unwiredGitHub: GitHub = {
   getChecks: refuse('GitHub'),
   mergePullRequest: refuse('GitHub'),
   getBlockers: refuse('GitHub'),
+  detectChanges: refuse('GitHub'),
+  readRepo: refuse('GitHub'),
 };
 
 export const unwiredAgentRunner: AgentRunner = {

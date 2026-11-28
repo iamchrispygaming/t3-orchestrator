@@ -26,6 +26,7 @@ import { GhNotLoggedIn, type GhAuth } from './gh-auth.ts';
 import type { GitHub } from './github.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
 import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
+import { GitHubPoller } from './poller.ts';
 import { Store } from './store.ts';
 import { readWebFile } from './web-files.ts';
 
@@ -61,25 +62,29 @@ export function createServer(deps: ServerDeps): Server {
   const dataFolder = resolveDataFolder(deps.env);
   mkdirSync(dataFolder, { recursive: true });
   const store = new Store(join(dataFolder, 't3o.db'));
+  const clock = deps.clock ?? systemClock;
+  const log = deps.log ?? ((message: string, error?: unknown) => console.error(message, error));
   const engine = new Engine({
     store,
     github: deps.github,
     agentRunner: deps.agentRunner,
-    clock: deps.clock ?? systemClock,
+    clock,
     notifier: deps.notifier ?? silentNotifier,
     dataFolder,
-    log: deps.log ?? ((message, error) => console.error(message, error)),
+    log,
     stopPlannerWork: (repoId) => planner.stopTurnsOn(repoId),
   });
   const planner = new Planner({
     store,
     approveDraft: (id, repoId, draft) => engine.approveDraft(id, repoId, draft),
     agentRunner: deps.agentRunner,
-    clock: deps.clock ?? systemClock,
+    clock,
     dataFolder,
-    log: deps.log ?? ((message, error) => console.error(message, error)),
+    log,
   });
   planner.resume();
+  const poller = new GitHubPoller({ store, github: deps.github, engine, clock, log });
+  poller.start();
   const openStreams = new Set<() => void>();
 
   const app = new Hono();
@@ -220,6 +225,7 @@ export function createServer(deps: ServerDeps): Server {
   return {
     app,
     async close() {
+      await poller.stop();
       await Promise.all([engine.stop(), planner.stop()]);
       for (const end of openStreams) end();
       store.close();
