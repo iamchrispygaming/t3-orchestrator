@@ -7,6 +7,7 @@ export const STATE_LABELS: Record<TicketState, string> = {
   ready: 'Up next',
   running: 'Running',
   reviewing: 'In review',
+  'awaiting-merge': 'Awaiting merge',
   merged: 'Merged',
   handback: 'Handed back',
 };
@@ -16,19 +17,20 @@ export const STATE_STYLES: Record<TicketState, string> = {
   ready: 'text-zinc-400 bg-white/5',
   running: 'text-green-400 bg-green-500/10',
   reviewing: 'text-blue-400 bg-blue-500/10',
+  'awaiting-merge': 'text-red-300 bg-red-400/10',
   merged: 'text-violet-300 bg-violet-400/10',
   handback: 'text-red-300 bg-red-400/10',
 };
 
-// States where the Orchestrator waits for the user. Handback is here; Awaiting
-// merge arrives with #28.
-const NEEDS_YOU: ReadonlySet<TicketState> = new Set<TicketState>(['handback']);
+// States where the Orchestrator waits for the user: Handback, and Awaiting merge
+// (the merge Checkpoint).
+const NEEDS_YOU: ReadonlySet<TicketState> = new Set<TicketState>(['handback', 'awaiting-merge']);
 
 export function needsYou(ticket: Ticket): boolean {
   return NEEDS_YOU.has(ticket.state);
 }
 
-const ORDER: TicketState[] = ['handback', 'reviewing', 'running', 'ready', 'waiting', 'merged'];
+const ORDER: TicketState[] = ['handback', 'awaiting-merge', 'reviewing', 'running', 'ready', 'waiting', 'merged'];
 
 // Cards needing the user first, then the rest by how far along they are.
 export function cardOrder(tickets: Ticket[]): Ticket[] {

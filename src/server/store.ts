@@ -360,6 +360,7 @@ export class Store {
       state?: TicketState;
       prNumber?: number;
       tier?: ModelTier;
+      door?: Door;
       handbackReason?: string;
       publishedHead?: string;
     },
@@ -369,6 +370,7 @@ export class Store {
     if (change.tier !== undefined) {
       this.db.prepare('UPDATE tickets SET tier = ? WHERE id = ?').run(JSON.stringify(change.tier), id);
     }
+    if (change.door !== undefined) this.db.prepare('UPDATE tickets SET door = ? WHERE id = ?').run(change.door, id);
     if (change.handbackReason !== undefined) {
       this.db.prepare('UPDATE tickets SET handback_reason = ? WHERE id = ?').run(change.handbackReason, id);
     }
