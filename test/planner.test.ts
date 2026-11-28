@@ -280,7 +280,7 @@ describe('the Planner interview', () => {
       .script('plan', () => drafted(draft, { sessionId: 'claude-session' }))
       .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }], { sessionId: 'codex-session' }));
     const api = start();
-    expect(await api.getSettings()).toEqual({ plannerTier: opusHigh });
+    expect((await api.getSettings()).plannerTier).toEqual(opusHigh);
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
     const events = await api.events();
     const open = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
@@ -301,7 +301,7 @@ describe('the Planner interview', () => {
       [codex, undefined],
     ]);
     for (const server of servers.splice(0)) await server.close();
-    expect(await start().getSettings()).toEqual({ plannerTier: codex });
+    expect((await start().getSettings()).plannerTier).toEqual(codex);
   });
 
   it("drops a discarded Plan's late Planner result instead of saving it on another Plan", async () => {

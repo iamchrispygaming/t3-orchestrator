@@ -1,4 +1,13 @@
-import type { Blocker, ChecksState, GitHub, Issue, MergeMethod, NewPullRequest, RepoInfo } from '../../src/server/github.ts';
+import type {
+  Blocker,
+  ChecksState,
+  FailedJob,
+  GitHub,
+  Issue,
+  MergeMethod,
+  NewPullRequest,
+  RepoInfo,
+} from '../../src/server/github.ts';
 import { git } from './git.ts';
 
 export type FakePullRequest = NewPullRequest & {
@@ -19,6 +28,7 @@ type FakeRepo = {
 
   pulls: FakePullRequest[];
   checks: ChecksState;
+  failedJobs: FailedJob[];
 };
 
 // Holds issues, PRs and CI status. Branches live in the local bare repo that
@@ -43,6 +53,7 @@ export class FakeGitHub implements GitHub {
       },
     };
   }
+  private failing = new Set<keyof GitHub>();
 
   addRepo(owner: string, name: string, remotePath: string, defaultBranch = 'main'): void {
     this.repos.set(`${owner}/${name}`.toLowerCase(), {
@@ -52,6 +63,7 @@ export class FakeGitHub implements GitHub {
       closedByMerge: new Set(),
       pulls: [],
       checks: 'success',
+      failedJobs: [],
     });
   }
 
@@ -82,6 +94,16 @@ export class FakeGitHub implements GitHub {
   releaseChecks(): void {
     this.checksHeld?.resolve();
     this.checksHeld = undefined;
+  }
+
+  // CI status for every ref, as GitHub would report it "now".
+  setChecks(owner: string, name: string, checks: ChecksState, failedJobs: FailedJob[] = []): void {
+    Object.assign(this.repo(owner, name), { checks, failedJobs });
+  }
+
+  // The next call to `method` fails, as if GitHub were unreachable.
+  failNext(method: keyof GitHub): void {
+    this.failing.add(method);
   }
 
   issue(owner: string, name: string, number: number): Issue | undefined {
@@ -126,6 +148,7 @@ export class FakeGitHub implements GitHub {
   }
 
   async createPullRequest(owner: string, name: string, pr: NewPullRequest): Promise<{ number: number }> {
+    this.maybeFail('createPullRequest');
     const repo = this.repo(owner, name);
     if (!this.branches(owner, name).includes(pr.head)) throw new Error(`branch ${pr.head} was never pushed`);
     const number = this.nextNumber++;
@@ -133,16 +156,33 @@ export class FakeGitHub implements GitHub {
     return { number };
   }
 
+  async updatePullRequest(owner: string, name: string, number: number, change: { body: string }): Promise<void> {
+    this.maybeFail('updatePullRequest');
+    Object.assign(this.openPull(owner, name, number), change);
+  }
+
+  async markPullRequestReady(owner: string, name: string, number: number): Promise<void> {
+    this.maybeFail('markPullRequestReady');
+    this.openPull(owner, name, number).draft = false;
+  }
+
   async getChecks(owner: string, name: string, _ref: string): Promise<ChecksState> {
+    this.maybeFail('getChecks');
     while (this.checksHeld) await this.checksHeld.promise;
     return this.repo(owner, name).checks;
   }
 
+  async getFailedJobs(owner: string, name: string, _ref: string): Promise<FailedJob[]> {
+    this.maybeFail('getFailedJobs');
+    return this.repo(owner, name).failedJobs.map((job) => ({ ...job }));
+  }
+
   async mergePullRequest(owner: string, name: string, number: number, method: MergeMethod): Promise<void> {
-    const repo = this.repo(owner, name);
-    const pr = repo.pulls.find((p) => p.number === number);
-    if (!pr || pr.state !== 'open') throw new Error(`PR #${number} is not open`);
+    this.maybeFail('mergePullRequest');
+    const pr = this.openPull(owner, name, number);
+    if (pr.draft) throw new Error(`PR #${number} is still a draft`);
     Object.assign(pr, { state: 'closed', merged: true, mergeMethod: method });
+    const repo = this.repo(owner, name);
     // Like GitHub: a merged PR closes the issues its body names with "Closes #n".
     for (const match of pr.body.matchAll(/\bCloses #(\d+)\b/gi)) {
       const issue = repo.issues.get(Number(match[1]));
@@ -151,6 +191,16 @@ export class FakeGitHub implements GitHub {
         repo.closedByMerge.add(issue.number);
       }
     }
+  }
+
+  private maybeFail(method: keyof GitHub): void {
+    if (this.failing.delete(method)) throw new Error(`GitHub ${method} failed: 502 Bad Gateway`);
+  }
+
+  private openPull(owner: string, name: string, number: number): FakePullRequest {
+    const pr = this.repo(owner, name).pulls.find((p) => p.number === number);
+    if (!pr || pr.state !== 'open') throw new Error(`PR #${number} is not open`);
+    return pr;
   }
 
   private repo(owner: string, name: string): FakeRepo {

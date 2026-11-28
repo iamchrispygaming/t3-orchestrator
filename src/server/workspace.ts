@@ -1,6 +1,7 @@
 // The repo workspace: per Target Repo a bare clone, per-Ticket worktrees and
 // scratch folders, under `<data>/repos/<owner>/<repo>/{git,work/<n>,scratch/<n>}`.
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -55,12 +56,21 @@ export class RepoWorkspace {
     await git(this.gitDir, 'fetch', '--prune', 'origin');
   }
 
+  ticketFolders(issueNumber: number): TicketFolders {
+    return {
+      worktree: join(this.root, 'work', String(issueNumber)),
+      scratch: join(this.root, 'scratch', String(issueNumber)),
+    };
+  }
+
   // A fresh worktree for the Ticket on `branch`, reset to the latest default branch.
+  // An earlier Run's worktree (and its commits on `branch`) is thrown away first.
   prepareTicket(issueNumber: number, branch: string, defaultBranch: string): Promise<TicketFolders> {
     return serially(this.gitDir, async () => {
-      const worktree = join(this.root, 'work', String(issueNumber));
-      const scratch = join(this.root, 'scratch', String(issueNumber));
+      const { worktree, scratch } = this.ticketFolders(issueNumber);
       await git(this.gitDir, 'fetch', '--prune', 'origin');
+      if (existsSync(worktree)) await git(this.gitDir, 'worktree', 'remove', '--force', worktree);
+      await git(this.gitDir, 'worktree', 'prune');
       await git(this.gitDir, 'worktree', 'add', '-B', branch, worktree, `origin/${defaultBranch}`);
       await mkdir(scratch, { recursive: true });
       return { worktree, scratch };
@@ -97,9 +107,31 @@ export class RepoWorkspace {
   }
 
   // Only the Orchestrator pushes; Agents just commit in their worktree.
-  push(branch: string): Promise<void> {
+  // Force-pushes `branch` only while the remote branch is still at `expectedHead`,
+  // the head the Orchestrator last published (null: the branch must not exist yet),
+  // so a commit someone else pushed is never overwritten. Returns the pushed head.
+  push(branch: string, expectedHead: string | null): Promise<string> {
     return serially(this.gitDir, async () => {
-      await git(this.gitDir, 'push', '--force', 'origin', `refs/heads/${branch}:refs/heads/${branch}`);
+      const ref = `refs/heads/${branch}`;
+      try {
+        await git(this.gitDir, 'push', `--force-with-lease=${ref}:${expectedHead ?? ''}`, 'origin', `${ref}:${ref}`);
+      } catch (error) {
+        if (/stale info|\[rejected\]/.test(String((error as { stderr?: unknown }).stderr ?? error))) {
+          throw new BranchMoved(branch);
+        }
+        throw error;
+      }
+      return git(this.gitDir, 'rev-parse', ref);
     });
+  }
+}
+
+// The remote branch is no longer where the Orchestrator left it: someone else pushed.
+export class BranchMoved extends Error {
+  readonly branch: string;
+
+  constructor(branch: string) {
+    super(`${branch} changed on GitHub since the Orchestrator last pushed it`);
+    this.branch = branch;
   }
 }

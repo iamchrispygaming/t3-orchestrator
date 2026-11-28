@@ -14,6 +14,12 @@ const RUN_OUTCOMES: Record<NonNullable<TicketDetail['runs'][number]['outcome']>,
   failed: 'failed',
   cannot: 'judged it impossible',
   'needs-permission': 'needs a permission',
+  crashed: 'crashed',
+  'timed-out': 'ran out of time',
+  'no-commits': 'made no commits',
+  'ci-failed': 'CI failed',
+  'quota-hit': 'hit its quota (no tier used)',
+  interrupted: 'cut short (no tier used)',
 };
 
 const VERDICTS: Record<NonNullable<TicketDetail['reviews'][number]['verdict']>, string> = {

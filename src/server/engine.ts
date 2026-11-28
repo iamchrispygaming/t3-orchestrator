@@ -2,38 +2,44 @@
 // the AgentRunner and GitHub ports, the store and the repo workspace.
 //
 // Waiting -> Ready when every blocker is Merged; Ready -> Running when the
-// Ticket's Agent has a free slot, in queue order; then the tracer-bullet path
-// Running -> Reviewing -> Merged. Every other branch of the state machine stops
-// with NotYetHandled until the ticket that builds it lands (Escalation #26, Review #27, doors #28, ...).
+// Ticket's Agent has a free slot, in queue order; then Running -> Reviewing ->
+// Merged, and Escalation (a failed Run goes back to Ready one Model Tier up;
+// failing at the top is a Handback). Every other branch of the state machine
+// stops with NotYetHandled until the ticket that builds it lands (Review #27,
+// doors #28, Handback actions #30, ...).
 import { z } from 'zod';
-import type {
-  Agent,
-  Door,
-  ModelTier,
-  ApprovedPlan,
-  ParallelLimits,
-  RegisterApprovedPlanRequest,
-  RegisterTicketRequest,
-  TargetRepo,
-  Ticket,
-  TicketState,
-  UpdateParallelLimitsRequest,
+import {
+  escalationSettingsSchema,
+  type Agent,
+  type ApprovedPlan,
+  type Door,
+  type EscalationSettings,
+  type ModelTier,
+  type ParallelLimits,
+  type RegisterApprovedPlanRequest,
+  type RegisterTicketRequest,
+  type RunOutcomeKind,
+  type TargetRepo,
+  type Ticket,
+  type TicketState,
+  type UpdateParallelLimitsRequest,
 } from '../shared/api.ts';
 import {
   reviewOutcomeSchema,
   runOutcomeSchema,
   type AgentRunner,
+  type RunEvent,
   type RunMode,
   type RunOutcome,
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import { deleteRunLogs } from './data-folder.ts';
-import type { GitHub } from './github.ts';
+import type { FailedJob, GitHub } from './github.ts';
+import { DEFAULT_ESCALATION_SETTINGS, nextTier, tierLabel } from './ladder.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
-import { RepoWorkspace, type TicketFolders } from './workspace.ts';
+import { BranchMoved, RepoWorkspace, type TicketFolders } from './workspace.ts';
 
-export const RUN_TIME_LIMIT_MS = 60 * 60_000;
 // Live output kept in memory per Ticket; older lines drop off.
 export const OUTPUT_LINES_KEPT = 2000;
 
@@ -58,6 +64,22 @@ export type EngineDeps = {
 
 type Call = 'one-way' | 'two-way' | 'unclear';
 
+// How the Agent's side of a Run ended.
+type AgentEnd<T> =
+  | { kind: 'result'; result: T }
+  | { kind: 'crashed'; message: string }
+  | { kind: 'timed-out' }
+  | { kind: 'quota-hit' }
+  | { kind: 'stopped' }; // the server is stopping
+
+// How a whole Run ended, once commits and CI are checked.
+type RunEnd =
+  | { kind: 'succeeded'; run: RunOutcome; prNumber: number }
+  | { kind: 'failed'; outcome: RunOutcomeKind; reason: string }
+  | { kind: 'not-a-failure' } // quota hit, Orchestrator or GitHub error: no Model Tier used up
+  | { kind: 'handback'; reason: string } // stopped for the user, no Model Tier used up
+  | { kind: 'stopped' };
+
 // Any one-way call wins; an unclear call counts as one-way.
 function mostCautious(...calls: Call[]): Door {
   return calls.every((c) => c === 'two-way') ? 'two-way' : 'one-way';
@@ -74,9 +96,34 @@ export function branchName(issueNumber: number, title: string): string {
   return `t3o/${issueNumber}-${slug || 'issue'}`;
 }
 
-function publicTicket({ body: _body, ...ticket }: StoredTicket): Ticket {
+function publicTicket({ body: _body, publishedHead: _head, ...ticket }: StoredTicket): Ticket {
   return ticket;
 }
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+type Diagnostics = { agentReason?: string; failedJobs?: FailedJob[] };
+
+// What the next Run is told about a failed one: why it failed, the Agent's own
+// stated reason, and each failing CI job's name and log tail, whichever exist.
+function failureNote(tier: ModelTier, outcome: RunOutcomeKind, reason: string, diagnostics: Diagnostics): string {
+  const agentReason = diagnostics.agentReason?.trim();
+  const jobs = (diagnostics.failedJobs ?? []).map((job) => `### ${job.name}\n\n\`\`\`\n${job.logTail}\n\`\`\``);
+  return [
+    `The previous Run, at ${tierLabel(tier)}, ended ${outcome}: ${reason}`,
+    ...(agentReason && agentReason !== reason ? [`The Agent said: ${agentReason}`] : []),
+    ...(jobs.length > 0 ? ['Failing CI jobs:', ...jobs] : []),
+  ].join('\n\n');
+}
+
+function runInstructions(ticket: StoredTicket, note: string | null): string {
+  const task = `# ${ticket.title}\n\n${ticket.body}`;
+  if (note === null) return task;
+  return `${task}\n\n## Why the previous Run failed\n\n${note}\n\nYou start fresh from the latest default branch. Don't repeat that failure.`;
+}
+
 
 export class Engine {
   private listeners = new Set<(ticket: Ticket) => void>();
@@ -231,6 +278,24 @@ export class Engine {
     return limits;
   }
 
+  // The Ladder and the Run time limit, each stored under its own settings key.
+  settings(): EscalationSettings {
+    const { store } = this.deps;
+    const keys = Object.keys(DEFAULT_ESCALATION_SETTINGS) as (keyof EscalationSettings)[];
+    const stored = Object.fromEntries(keys.flatMap((key) => {
+      const value = store.getSetting(key);
+      return value === undefined ? [] : [[key, value]];
+    }));
+    return escalationSettingsSchema.parse({ ...DEFAULT_ESCALATION_SETTINGS, ...stored });
+  }
+
+  updateSettings(change: Partial<EscalationSettings>): EscalationSettings {
+    for (const [key, value] of Object.entries(change)) {
+      if (value !== undefined) this.deps.store.setSetting(key, value);
+    }
+    return this.settings();
+  }
+
   // Stops in-flight Runs and waits for them to wind down.
   async stop(): Promise<void> {
     this.stopping.abort();
@@ -317,8 +382,9 @@ export class Engine {
     for (const listener of this.outputListeners) listener(id, text);
   }
 
+  // Runs a Ticket that schedule() started: it holds a slot of its Agent.
   private async work(id: number): Promise<void> {
-    const { store, github, clock } = this.deps;
+    const { store } = this.deps;
     const ticket = store.getTicket(id)!;
     const repo = store.getTargetRepo(ticket.repoId);
     // A Ticket never starts on a Target Repo that is gone or being removed (the ready
@@ -328,74 +394,285 @@ export class Engine {
       this.freeSlot(ticket.tier.agent);
       return;
     }
+    const end = await this.run(id, repo);
+    switch (end.kind) {
+      case 'stopped':
+        return; // the Run record stays open; restart recovery (#34) redoes it at the same tier
+      case 'not-a-failure':
+        // Back in the queue at the same Model Tier: the next schedule() picks it up.
+        // Not started again from here, so a lasting GitHub error can't spin.
+        this.setState(id, 'ready');
+        return;
+      case 'failed':
+        this.escalate(id, end.outcome, end.reason);
+        return;
+      case 'handback':
+        this.deps.store.updateTicket(id, { state: 'handback', handbackReason: end.reason });
+        this.emit(id);
+        return;
+      case 'succeeded':
+        await this.review(id, end.run, end.prNumber);
+    }
+  }
+
+  // Exactly one Model Tier up per failure. At the top of the Ladder: Handback.
+  private escalate(id: number, outcome: RunOutcomeKind, reason: string): void {
+    const ticket = this.deps.store.getTicket(id)!;
+    const next = nextTier(this.settings().ladder, ticket.tier);
+    if (!next) {
+      const handbackReason = `Failed at ${tierLabel(ticket.tier)}, the most capable Model Tier on the Ladder (${outcome}): ${reason}`;
+      this.deps.store.updateTicket(id, { state: 'handback', handbackReason });
+      this.emit(id);
+      return;
+    }
+    this.deps.store.updateTicket(id, { state: 'ready', tier: next });
+    this.emit(id);
+    this.schedule(); // the next tier may be another Agent's: it queues for that Agent's slot
+  }
+
+  // One Run: a fresh worktree, the Agent, then commits, push, draft PR and CI.
+  // The Agent's slot is held until the Agent has wound down, not while the
+  // Orchestrator pushes, opens the PR and waits on CI.
+  private async run(id: number, repo: TargetRepo): Promise<RunEnd> {
+    const { store, github, clock, log } = this.deps;
+    const ticket = store.getTicket(id)!;
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
+    const { runTimeLimitMinutes } = this.settings();
 
     let folders: TicketFolders;
-    let run: RunOutcome;
+    let runId: number;
+    let agentEnd: AgentEnd<RunOutcome>;
     try {
-      folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
-      const runId = store.startRun(id, ticket.tier, clock.now());
+      try {
+        folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
+      } catch (error) {
+        log('Could not prepare the worktree', error);
+        return { kind: 'not-a-failure' };
+      }
+      const instructions = runInstructions(ticket, store.lastFailureNote(id));
+      runId = store.startRun(id, ticket.tier, clock.now());
       this.emit(id);
-      run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
-      store.endRun(runId, clock.now(), run.status, run.reason);
-      this.emit(id);
+      agentEnd = await this.runAgent('run', id, ticket.tier, folders, runOutcomeSchema, instructions, runTimeLimitMinutes);
     } finally {
       this.freeSlot(ticket.tier.agent);
     }
-    if (run.status !== 'done') throw new NotYetHandled(`Run ended ${run.status}: ${run.reason}`);
-    if ((await workspace.commitsAhead(ticket.branch, repo.defaultBranch)) === 0) {
-      throw new NotYetHandled('Run made no commits');
+    const endedAt = clock.now();
+    if (agentEnd.kind === 'stopped') return { kind: 'stopped' };
+    // The Run record shows the Agent's own report as soon as the Agent is done;
+    // it gets its final outcome (no commits, red CI, ...) once that is known.
+    if (agentEnd.kind === 'result') {
+      const { status, reason } = agentEnd.result;
+      store.endRun(runId, endedAt, status, status === 'done' ? null : reason);
+      this.emit(id);
     }
 
-    await workspace.push(ticket.branch);
-    const pr = await github.createPullRequest(repo.owner, repo.name, {
+    const fail = (outcome: RunOutcomeKind, reason: string, diagnostics: Diagnostics = {}): RunEnd => {
+      store.endRun(runId, endedAt, outcome, reason, failureNote(ticket.tier, outcome, reason, diagnostics));
+      this.emit(id);
+      return { kind: 'failed', outcome, reason };
+    };
+    // CI results that are already in, for the note only: never waits on CI, and a
+    // GitHub error here doesn't change the Run's outcome.
+    const redJobsSoFar = async (): Promise<FailedJob[]> => {
+      try {
+        if ((await github.getChecks(repo.owner, repo.name, ticket.branch)) !== 'failure') return [];
+        return await github.getFailedJobs(repo.owner, repo.name, ticket.branch);
+      } catch (error) {
+        log('Could not read CI results for the failure note', error);
+        return [];
+      }
+    };
+
+    try {
+      // Whatever the Run's outcome, its commits go up: the PR opens as a draft
+      // after the first Run with commits, and later Runs force-push the branch.
+      const commits = await workspace.commitsAhead(ticket.branch, repo.defaultBranch);
+      let prNumber = ticket.prNumber;
+      if (commits > 0) {
+        const head = await workspace.push(ticket.branch, ticket.publishedHead);
+        store.updateTicket(id, { publishedHead: head });
+        if (prNumber === null) {
+          const run = agentEnd.kind === 'result' ? agentEnd.result : undefined;
+          prNumber = await this.openDraftPullRequest(ticket, repo, run);
+        }
+      }
+
+      const jobsIfCommitted = () => (commits > 0 ? redJobsSoFar() : Promise.resolve([]));
+      switch (agentEnd.kind) {
+        case 'quota-hit':
+          store.endRun(runId, endedAt, 'quota-hit', "the Agent's quota ran out mid-Run");
+          this.emit(id);
+          return { kind: 'not-a-failure' };
+        case 'crashed':
+          return fail('crashed', `the Agent crashed: ${agentEnd.message}`, { failedJobs: await jobsIfCommitted() });
+        case 'timed-out':
+          return fail('timed-out', `the Run time limit (${runTimeLimitMinutes} min) passed`, {
+            failedJobs: await jobsIfCommitted(),
+          });
+      }
+      const run = agentEnd.result;
+      if (run.status === 'failed' || run.status === 'cannot') {
+        return fail(run.status, run.reason, { failedJobs: await jobsIfCommitted() });
+      }
+      if (run.status === 'needs-permission') {
+        store.endRun(runId, endedAt, run.status, run.reason);
+        this.emit(id);
+        throw new NotYetHandled(`Run ended needs-permission: ${run.reason}`);
+      }
+      if (commits === 0 || prNumber === null) {
+        return fail('no-commits', 'the Run made no commits', { agentReason: run.reason });
+      }
+
+      const checks = await github.getChecks(repo.owner, repo.name, ticket.branch);
+      if (checks === 'failure') {
+        // Red CI is the failure; the job names and log tails are best effort.
+        let failedJobs: FailedJob[] = [];
+        try {
+          failedJobs = await github.getFailedJobs(repo.owner, repo.name, ticket.branch);
+        } catch (error) {
+          log('Could not read the failing CI jobs', error);
+        }
+        const reason = `CI failed: ${failedJobs.map((j) => j.name).join(', ') || 'job logs unavailable'}`;
+        return fail('ci-failed', reason, { agentReason: run.reason, failedJobs });
+      }
+      if (checks !== 'success') throw new NotYetHandled(`CI is ${checks}`); // CI wait comes with #30
+
+      await github.updatePullRequest(repo.owner, repo.name, prNumber, { body: this.pullRequestBody(ticket, run) });
+      await github.markPullRequestReady(repo.owner, repo.name, prNumber);
+      store.endRun(runId, endedAt, 'done', null);
+      this.emit(id);
+      return { kind: 'succeeded', run, prNumber };
+    } catch (error) {
+      if (error instanceof NotYetHandled) throw error;
+      if (error instanceof BranchMoved) {
+        // Someone pushed to the Ticket's branch: never overwrite their work. Not the
+        // Agent's failure, so no Model Tier is used up; the user decides (#30).
+        const reason = `Not pushing: ${error.message}. Someone else's commits are on it; the Orchestrator won't overwrite them.`;
+        store.endRun(runId, endedAt, 'interrupted', reason);
+        this.emit(id);
+        return { kind: 'handback', reason };
+      }
+      // An Orchestrator or GitHub error is not the Agent's failure.
+      log('Run cut short by an Orchestrator or GitHub error', error);
+      store.endRun(runId, endedAt, 'interrupted', `Orchestrator or GitHub error: ${errorMessage(error)}`);
+      this.emit(id);
+      return { kind: 'not-a-failure' };
+    }
+  }
+
+  private pullRequestBody(ticket: StoredTicket, run: RunOutcome | undefined): string {
+    const body = run?.prBody.trim() ? run.prBody : 'Work in progress: no Run has succeeded yet.';
+    return `${body}\n\nCloses #${ticket.issueNumber}`;
+  }
+
+  private async openDraftPullRequest(ticket: StoredTicket, repo: TargetRepo, run: RunOutcome | undefined) {
+    const pr = await this.deps.github.createPullRequest(repo.owner, repo.name, {
       head: ticket.branch,
       base: repo.defaultBranch,
       title: ticket.title,
-      body: `${run.prBody}\n\nCloses #${ticket.issueNumber}`,
+      body: this.pullRequestBody(ticket, run),
+      draft: true,
     });
-    store.updateTicket(id, { prNumber: pr.number });
-    this.emit(id);
-    const checks = await github.getChecks(repo.owner, repo.name, ticket.branch);
-    if (checks !== 'success') throw new NotYetHandled(`CI is ${checks}`);
+    this.deps.store.updateTicket(ticket.id, { prNumber: pr.number });
+    this.emit(ticket.id);
+    return pr.number;
+  }
+
+  private async review(id: number, run: RunOutcome, prNumber: number): Promise<void> {
+    const { store, github, clock } = this.deps;
+    const ticket = store.getTicket(id)!;
+    const repo = store.getTargetRepo(ticket.repoId)!;
+    const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
+    const folders = workspace.ticketFolders(ticket.issueNumber);
 
     this.setState(id, 'reviewing');
     // Simplest reviewer rule for now: the Run's own Model Tier (#27 picks the other Agent).
     const reviewTier = ticket.tier;
     const reviewId = store.startReview(id, reviewTier, clock.now());
     this.emit(id);
-    const review = await this.runAgent('review', reviewTier, folders.worktree, folders.scratch, reviewOutcomeSchema, ticket);
+    const end = await this.runAgent(
+      'review',
+      id,
+      reviewTier,
+      folders,
+      reviewOutcomeSchema,
+      `# ${ticket.title}\n\n${ticket.body}`,
+      this.settings().runTimeLimitMinutes,
+    );
+    if (end.kind !== 'result') throw new NotYetHandled(`Review ended ${end.kind}`);
+    const review = end.result;
     store.endReview(reviewId, clock.now(), review.verdict, review.findings);
     this.emit(id);
     if (review.verdict !== 'approve') throw new NotYetHandled(`Review verdict ${review.verdict}`);
 
     if (mostCautious(ticket.door, run.door, review.door) !== 'two-way') throw new NotYetHandled('One-way Ticket');
-    await github.mergePullRequest(repo.owner, repo.name, pr.number, 'squash');
+    await github.mergePullRequest(repo.owner, repo.name, prNumber, 'squash');
     await this.merged(ticket);
   }
 
+  // Runs the Agent until its result, a crash, a quota hit, the time limit on the
+  // engine's clock, or a server stop, whichever comes first.
   private async runAgent<S extends z.ZodType>(
     mode: RunMode,
+    ticketId: number,
     tier: ModelTier,
-    cwd: string,
-    scratchDir: string,
+    folders: TicketFolders,
     schema: S,
-    ticket: StoredTicket,
-  ): Promise<z.infer<S>> {
-    const events = this.deps.agentRunner.start({
-      tier,
-      cwd,
-      scratchDir,
-      mode,
-      instructions: `# ${ticket.title}\n\n${ticket.body}`,
-      resultSchema: z.toJSONSchema(schema) as Record<string, unknown>,
-      timeoutMs: RUN_TIME_LIMIT_MS,
-      signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(RUN_TIME_LIMIT_MS)]),
+    instructions: string,
+    timeLimitMinutes: number,
+  ): Promise<AgentEnd<z.infer<S>>> {
+    const timeoutMs = timeLimitMinutes * 60_000;
+    const timeLimit = new AbortController();
+    const cancelTimer = this.deps.clock.setTimer(timeoutMs, () => timeLimit.abort());
+    const signal = AbortSignal.any([this.stopping.signal, timeLimit.signal]);
+    const aborted = new Promise<'aborted'>((resolve) => {
+      if (signal.aborted) resolve('aborted');
+      signal.addEventListener('abort', () => resolve('aborted'), { once: true });
     });
-    for await (const event of events) {
-      if (event.type === 'text') this.emitOutput(ticket.id, event.text);
-      if (event.type === 'result') return schema.parse(event.result);
+    let quotaHit = false;
+    let result: z.infer<S> | undefined;
+    let crash: string | undefined;
+    let iterator: AsyncIterator<RunEvent> | undefined;
+    try {
+      iterator = this.deps.agentRunner
+        .start({
+          tier,
+          cwd: folders.worktree,
+          scratchDir: folders.scratch,
+          mode,
+          instructions,
+          resultSchema: z.toJSONSchema(schema) as Record<string, unknown>,
+          timeoutMs,
+          signal,
+        })
+        [Symbol.asyncIterator]();
+      // Read to the end of the stream, past the result: the Agent has only finished
+      // once it has exited, and a bad exit after a result still fails the Run.
+      for (;;) {
+        const step = await Promise.race([iterator.next(), aborted]);
+        if (step === 'aborted' || step.done) break;
+        const event = step.value;
+        if (event.type === 'text') this.emitOutput(ticketId, event.text);
+        if (event.type === 'rate-limit' && event.status === 'rejected') quotaHit = true;
+        if (event.type === 'result' && result === undefined) result = schema.parse(event.result);
+      }
+    } catch (error) {
+      crash = errorMessage(error);
     }
-    throw new NotYetHandled(`${mode} ended without a result`);
+    // Always close the stream and wait for the Agent to wind down, so nothing
+    // counts commits, pushes or resets the worktree while it is still exiting.
+    // The time limit stays armed meanwhile, so an Agent stuck exiting is aborted.
+    await iterator?.return?.().catch(() => undefined);
+    cancelTimer();
+
+    // A quota hit, once seen, is the outcome: a slow exit that crosses the time
+    // limit afterwards must not turn it into a failure. Otherwise the time limit
+    // or a bad exit fails the Run even after it reported a result.
+    if (this.stopping.signal.aborted) return { kind: 'stopped' };
+    if (quotaHit) return { kind: 'quota-hit' };
+    if (timeLimit.signal.aborted) return { kind: 'timed-out' };
+    if (crash !== undefined) return { kind: 'crashed', message: crash };
+    if (result !== undefined) return { kind: 'result', result };
+    return { kind: 'crashed', message: `${mode} ended without a result` };
   }
 }

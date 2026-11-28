@@ -9,6 +9,7 @@ import type {
   PlanMessage,
   PlanStatus,
   ReviewRecord,
+  RunOutcomeKind,
   RunRecord,
   TargetRepo,
   Ticket,
@@ -113,13 +114,22 @@ const migrations: string[] = [
    UPDATE target_repos SET removed_at = '1970-01-01T00:00:00.000Z'
      WHERE id NOT IN (SELECT min(id) FROM target_repos GROUP BY lower(owner), lower(name));
    CREATE UNIQUE INDEX target_repos_live ON target_repos (lower(owner), lower(name)) WHERE removed_at IS NULL;`,
+  // Escalation: why a Run failed (and the note the next Run gets), the Handback
+  // reason, and the head the Orchestrator last pushed to the Ticket's branch.
+  `ALTER TABLE runs ADD COLUMN failure_note TEXT;
+   ALTER TABLE tickets ADD COLUMN handback_reason TEXT;
+   ALTER TABLE tickets ADD COLUMN published_head TEXT;`,
 ];
+
+// Run outcomes that are not failures: the next Run's instructions skip past them
+// to the last real failure.
+const NOT_FAILURES: RunOutcomeKind[] = ['quota-hit', 'interrupted'];
 
 export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
 
 export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
 
-export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber'> & {
+export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber' | 'handbackReason' | 'publishedHead'> & {
   planId: number;
   planPosition: number;
   blockers: Blocker[];
@@ -130,7 +140,8 @@ type Row = Record<string, unknown>;
 const SELECT_TICKETS = `SELECT t.*, r.owner || '/' || r.name AS repo
   FROM tickets t JOIN target_repos r ON r.id = t.repo_id`;
 
-export type StoredTicket = Ticket & { body: string };
+// `publishedHead`: the commit the Orchestrator last pushed to the Ticket's branch.
+export type StoredTicket = Ticket & { body: string; publishedHead: string | null };
 
 export type StoredPlan = {
   id: number;
@@ -339,9 +350,27 @@ export class Store {
     return (this.db.prepare(`${SELECT_TICKETS} WHERE t.repo_id = ? ORDER BY t.id`).all(repoId) as Row[]).map(toTicket);
   }
 
-  updateTicket(id: number, change: { state?: TicketState; prNumber?: number }): void {
+  updateTicket(
+    id: number,
+    change: {
+      state?: TicketState;
+      prNumber?: number;
+      tier?: ModelTier;
+      handbackReason?: string;
+      publishedHead?: string;
+    },
+  ): void {
     if (change.state !== undefined) this.db.prepare('UPDATE tickets SET state = ? WHERE id = ?').run(change.state, id);
     if (change.prNumber !== undefined) this.db.prepare('UPDATE tickets SET pr_number = ? WHERE id = ?').run(change.prNumber, id);
+    if (change.tier !== undefined) {
+      this.db.prepare('UPDATE tickets SET tier = ? WHERE id = ?').run(JSON.stringify(change.tier), id);
+    }
+    if (change.handbackReason !== undefined) {
+      this.db.prepare('UPDATE tickets SET handback_reason = ? WHERE id = ?').run(change.handbackReason, id);
+    }
+    if (change.publishedHead !== undefined) {
+      this.db.prepare('UPDATE tickets SET published_head = ? WHERE id = ?').run(change.publishedHead, id);
+    }
   }
 
   startRun(ticketId: number, tier: ModelTier, startedAt: Date): number {
@@ -351,10 +380,24 @@ export class Store {
     return Number(lastInsertRowid);
   }
 
-  endRun(id: number, endedAt: Date, outcome: NonNullable<RunRecord['outcome']>, reason: string): void {
+  // `reason` is null when the Run succeeded. `failureNote` is what the next Run is
+  // told about this one: the reason plus, for red CI, the failing jobs' log tails.
+  endRun(id: number, endedAt: Date, outcome: RunOutcomeKind, reason: string | null, failureNote: string | null = null): void {
     this.db
-      .prepare('UPDATE runs SET ended_at = ?, outcome = ?, reason = ? WHERE id = ?')
-      .run(endedAt.toISOString(), outcome, reason, id);
+      .prepare('UPDATE runs SET ended_at = ?, outcome = ?, reason = ?, failure_note = ? WHERE id = ?')
+      .run(endedAt.toISOString(), outcome, reason, failureNote, id);
+  }
+
+  // The note from the Ticket's last failed Run, unless a Run succeeded since.
+  lastFailureNote(ticketId: number): string | null {
+    const rows = this.db
+      .prepare('SELECT outcome, failure_note FROM runs WHERE ticket_id = ? AND outcome IS NOT NULL ORDER BY id DESC')
+      .all(ticketId) as Row[];
+    for (const row of rows) {
+      if (NOT_FAILURES.includes(row.outcome as RunOutcomeKind)) continue;
+      return row.failure_note == null ? null : String(row.failure_note);
+    }
+    return null;
   }
 
   listRuns(ticketId: number): RunRecord[] {
@@ -497,5 +540,7 @@ function toTicket(row: Row): StoredTicket {
     door: String(row.door) as Door,
     state: String(row.state) as TicketState,
     prNumber: row.pr_number == null ? null : Number(row.pr_number),
+    handbackReason: row.handback_reason == null ? null : String(row.handback_reason),
+    publishedHead: row.published_head == null ? null : String(row.published_head),
   };
 }

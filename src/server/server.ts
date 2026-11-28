@@ -14,6 +14,7 @@ import {
   startPlanRequestSchema,
   updateParallelLimitsRequestSchema,
   type ServerEvent,
+  updateSettingsRequestSchema,
   type TicketDetail,
 } from '../shared/api.ts';
 import type { AgentRunner } from './agent-runner.ts';
@@ -137,13 +138,18 @@ export function createServer(deps: ServerDeps): Server {
     return c.json(detail);
   });
 
-  app.get('/api/settings', (c) => c.json(settingsSchema.parse({ plannerTier: planner.plannerTier() })));
+  const settings = () => settingsSchema.parse({ plannerTier: planner.plannerTier(), ...engine.settings() });
 
+  app.get('/api/settings', (c) => c.json(settings()));
+
+  // Changes only the settings the body names.
   app.put('/api/settings', async (c) => {
-    const req = await parseBody(c.req.json(), settingsSchema);
+    const req = await parseBody(c.req.json(), updateSettingsRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
-    planner.setPlannerTier(req.data.plannerTier);
-    return c.json({ plannerTier: planner.plannerTier() });
+    const { plannerTier, ...escalation } = req.data;
+    if (plannerTier) planner.setPlannerTier(plannerTier);
+    engine.updateSettings(escalation);
+    return c.json(settings());
   });
 
   app.post('/api/plans', async (c) => {
