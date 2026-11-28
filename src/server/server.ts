@@ -7,6 +7,7 @@ import { streamSSE } from 'hono/streaming';
 import type { z } from 'zod';
 import {
   addTargetRepoRequestSchema,
+  editPlanDraftRequestSchema,
   registerApprovedPlanRequestSchema,
   registerTicketRequestSchema,
   replyToPlanRequestSchema,
@@ -72,6 +73,7 @@ export function createServer(deps: ServerDeps): Server {
   });
   const planner = new Planner({
     store,
+    approveDraft: (id, repoId, draft) => engine.approveDraft(id, repoId, draft),
     agentRunner: deps.agentRunner,
     clock: deps.clock ?? systemClock,
     dataFolder,
@@ -162,11 +164,21 @@ export function createServer(deps: ServerDeps): Server {
 
   app.get('/api/plans/:id', (c) => c.json(planner.plan(Number(c.req.param('id')))));
 
+  app.patch('/api/plans/:id/draft', async (c) => {
+    const req = await parseBody(c.req.json(), editPlanDraftRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(planner.editDraft(Number(c.req.param('id')), req.data));
+  });
+
   app.post('/api/plans/:id/messages', async (c) => {
     const req = await parseBody(c.req.json(), replyToPlanRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(await planner.reply(Number(c.req.param('id')), req.data));
   });
+
+  app.post('/api/plans/:id/approve', async (c) =>
+    c.json(await planner.approve(Number(c.req.param('id'))), 201),
+  );
 
   app.delete('/api/plans/:id', async (c) => {
     await planner.discard(Number(c.req.param('id')));

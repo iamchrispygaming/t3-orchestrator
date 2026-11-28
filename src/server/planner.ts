@@ -1,13 +1,16 @@
 // The Planner: a headless, resumable session at the one fixed Planner Model Tier,
 // read-only on a fresh checkout of the Target Repo's default branch. It interviews
 // the user in numbered rounds and keeps a structured Plan draft, all held locally
-// until the Plan is approved (#38) or discarded.
+// until the Plan is approved or discarded.
 import { existsSync } from 'node:fs';
 import { z } from 'zod';
 import {
   modelTierSchema,
   planDraftSchema,
   planQuestionSchema,
+  type ApprovedPlan,
+  type EditPlanDraftRequest,
+  type PlanDraft,
   type ModelTier,
   type Plan,
   type ReplyToPlanRequest,
@@ -32,6 +35,7 @@ export type PlanEvent = { type: 'plan'; plan: Plan } | { type: 'plan-discarded';
 
 export type PlannerDeps = {
   store: Store;
+  approveDraft: (id: number, repoId: number, draft: PlanDraft) => Promise<ApprovedPlan>;
   agentRunner: AgentRunner;
   clock: Clock;
   dataFolder: string;
@@ -59,9 +63,28 @@ function isJustDraft(text: string | undefined): boolean {
 
 const JUST_DRAFT = 'The user says: just draft it. Ask no more questions: return no questions and the complete Plan draft now.';
 
+function canPublish(draft: PlanDraft): boolean {
+  const tickets = new Map(draft.tickets.map((ticket) => [ticket.key, ticket]));
+  if (tickets.size === 0 || tickets.size !== draft.tickets.length) return false;
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  function visit(key: string): boolean {
+    if (visited.has(key)) return true;
+    const ticket = tickets.get(key);
+    if (!ticket || visiting.has(key)) return false;
+    visiting.add(key);
+    if (!ticket.blockedBy.every(visit)) return false;
+    visiting.delete(key);
+    visited.add(key);
+    return true;
+  }
+  return draft.tickets.every((ticket) => visit(ticket.key));
+}
+
 export class Planner {
   private listeners = new Set<(event: PlanEvent) => void>();
   private inFlight = new Set<Promise<void>>();
+  private approvals = new Map<number, Promise<ApprovedPlan>>();
   private aborts = new Map<number, AbortController>();
   private turns = new Map<number, Promise<void>>(); // each Plan's turn in progress
   private stopping = new AbortController();
@@ -107,10 +130,59 @@ export class Planner {
     return this.plan(plan.id);
   }
 
+  editDraft(id: number, req: EditPlanDraftRequest): Plan {
+    const plan = this.plan(id);
+    this.requireEditable(plan);
+    if (plan.status === 'thinking' || !plan.draft) throw new PlanBusy(`Plan ${id} has no editable draft`);
+    const draft = plan.draft;
+
+    if (req.spec) draft.spec = { ...draft.spec, ...req.spec };
+    if (req.ticket) {
+      const { key, tier, ...textAndDoor } = req.ticket;
+      const ticket = draft.tickets.find((entry) => entry.key === key);
+      if (!ticket) throw new PlanNotFound(`no Ticket ${key} on Plan ${id}`);
+      Object.assign(ticket, textAndDoor);
+      if (tier && (tier.agent !== ticket.tier.agent || tier.model !== ticket.tier.model || tier.effort !== ticket.tier.effort)) {
+        ticket.tier = tier;
+        ticket.tierReason = '';
+      }
+    }
+    this.deps.store.updatePlan(id, { draft });
+    this.emit(id);
+    return this.plan(id);
+  }
+
+  async approve(id: number): Promise<ApprovedPlan> {
+    const plan = this.plan(id);
+    if (this.stopping.signal.aborted || this.approvals.has(id)) throw new PlanBusy(`Plan ${id} cannot start approval now`);
+    if ((plan.status !== 'drafted' && plan.status !== 'publishing') || !plan.draft) throw new PlanBusy(`Plan ${id} is not ready for approval`);
+    const draft = plan.draft;
+    if (!canPublish(draft)) throw new PlanBusy(`Plan ${id} needs Tickets with unique keys and valid, acyclic blockers`);
+
+    this.deps.store.updatePlan(id, { status: 'publishing' });
+    const approval = this.deps.approveDraft(id, plan.repoId, draft);
+    this.approvals.set(id, approval);
+    this.emit(id);
+    try {
+      const approved = await approval;
+      this.emit(id);
+      return approved;
+    } finally {
+      this.approvals.delete(id);
+    }
+  }
+
+  private requireEditable(plan: Pick<Plan, 'id' | 'status'>): void {
+    if (plan.status === 'approved' || plan.status === 'publishing') {
+      throw new PlanBusy(`Plan ${plan.id} is being approved or is already approved`);
+    }
+  }
+
   async reply(id: number, req: ReplyToPlanRequest): Promise<Plan> {
     const { store, clock } = this.deps;
     const plan = store.getPlan(id);
     if (!plan) throw new PlanNotFound(`no Plan ${id}`);
+    this.requireEditable(plan);
     if (plan.status === 'thinking') throw new PlanBusy(`Plan ${id} is waiting on the Planner`);
     const repo = store.getTargetRepo(plan.repoId);
     if (repo && store.isTargetRepoRemoving(repo.id)) throw new PlanBusy(`${repo.owner}/${repo.name} is being removed`);
@@ -127,6 +199,7 @@ export class Planner {
     const { store } = this.deps;
     const plan = store.getPlan(id);
     if (!plan) throw new PlanNotFound(`no Plan ${id}`);
+    this.requireEditable(plan);
     this.aborts.get(id)?.abort();
     store.deletePlan(id);
     for (const listener of this.listeners) listener({ type: 'plan-discarded', planId: id });
@@ -153,6 +226,7 @@ export class Planner {
 
   async stop(): Promise<void> {
     this.stopping.abort();
+    await Promise.allSettled(this.approvals.values());
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
   }
 
@@ -183,8 +257,12 @@ export class Planner {
   }
 
   private publicPlan(plan: StoredPlan): Plan {
-    const { sessionId: _sessionId, ...rest } = plan;
-    return { ...rest, messages: this.deps.store.listPlanMessages(plan.id) };
+    const { sessionId: _sessionId, publishedIssues, ...rest } = plan;
+    return {
+      ...rest,
+      ...(plan.status === 'approved' ? { specIssue: publishedIssues[0] } : {}),
+      messages: this.deps.store.listPlanMessages(plan.id),
+    };
   }
 
   private emit(id: number): void {
@@ -257,7 +335,10 @@ export class Planner {
     const last = messages.at(-1);
     if (last?.from !== 'user') throw new Error('nothing for the Planner to answer');
     const schema = last.justDraft ? justDraftSchema : turnSchema;
-    const reply = last.justDraft ? `${JUST_DRAFT}\n\n${last.text}` : last.text;
+    const request = last.justDraft ? `${JUST_DRAFT}\n\n${last.text}` : last.text;
+    const reply = plan.draft
+      ? [request, "Use the current Plan draft below as the basis for your reply, including the user's direct edits. Return the full updated draft when you redraw it.", JSON.stringify(plan.draft, null, 2)].join('\n\n')
+      : request;
     const instructions = plan.sessionId
       ? reply
       : `${INTERVIEW_RULES}\n\nTarget Repo: ${repo.owner}/${repo.name} (default branch ${repo.defaultBranch}).\n\nThe idea:\n\n${reply}`;

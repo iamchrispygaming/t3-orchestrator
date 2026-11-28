@@ -4,7 +4,9 @@ import type {
   FailedJob,
   GitHub,
   Issue,
+  IssueRef,
   MergeMethod,
+  NewIssue,
   NewPullRequest,
   RepoInfo,
 } from '../../src/server/github.ts';
@@ -20,9 +22,13 @@ export type FakePullRequest = NewPullRequest & {
 // A blocking issue: a number in the same repo, or an issue in another repo.
 export type BlockerSpec = number | { owner: string; name: string; number: number };
 
+type PublishedIssue = Issue & { labels?: string[] };
+
 type FakeRepo = {
   info: RepoInfo;
-  issues: Map<number, Issue>;
+  issues: Map<number, PublishedIssue>;
+  children: Map<number, number[]>;
+  nextIssueNumber: number;
   blockedBy: Map<number, BlockerSpec[]>; // native issue dependencies, maybe in another repo
   closedByMerge: Set<number>; // issues a merged PR closed
 
@@ -36,6 +42,7 @@ type FakeRepo = {
 export class FakeGitHub implements GitHub {
   private repos = new Map<string, FakeRepo>();
   private nextNumber = 1000;
+  private subIssueUnavailable = false;
   private checksHeld: PromiseWithResolvers<void> | undefined;
   private issueGate: Promise<void> | null = null;
   private issueLookupStarted: (() => void) | null = null;
@@ -59,6 +66,8 @@ export class FakeGitHub implements GitHub {
     this.repos.set(`${owner}/${name}`.toLowerCase(), {
       info: { defaultBranch, cloneUrl: remotePath },
       issues: new Map(),
+      children: new Map(),
+      nextIssueNumber: 1000,
       blockedBy: new Map(),
       closedByMerge: new Set(),
       pulls: [],
@@ -106,7 +115,7 @@ export class FakeGitHub implements GitHub {
     this.failing.add(method);
   }
 
-  issue(owner: string, name: string, number: number): Issue | undefined {
+  issue(owner: string, name: string, number: number): PublishedIssue | undefined {
     return this.repo(owner, name).issues.get(number);
   }
 
@@ -135,6 +144,43 @@ export class FakeGitHub implements GitHub {
     const issue = this.repo(owner, name).issues.get(number);
     if (!issue) throw new Error(`no issue #${number} on ${owner}/${name}`);
     return { ...issue };
+  }
+
+  subIssues(owner: string, name: string, number: number): number[] {
+    return [...(this.repo(owner, name).children.get(number) ?? [])];
+  }
+
+  async createIssue({ owner, name }: Omit<IssueRef, 'number'>, issue: NewIssue): Promise<IssueRef> {
+    const repo = this.repo(owner, name);
+    while (repo.issues.has(repo.nextIssueNumber)) repo.nextIssueNumber++;
+    const number = repo.nextIssueNumber++;
+    repo.issues.set(number, { ...issue, number, state: 'open' });
+    return { owner, name, number };
+  }
+
+  failNextSubIssue(): void {
+    this.subIssueUnavailable = true;
+  }
+
+  async addSubIssue(parent: IssueRef, child: IssueRef): Promise<void> {
+    if (this.subIssueUnavailable) {
+      this.subIssueUnavailable = false;
+      throw new Error('GitHub temporarily unavailable');
+    }
+    await this.getIssue(parent.owner, parent.name, parent.number);
+    await this.getIssue(child.owner, child.name, child.number);
+    const repo = this.repo(parent.owner, parent.name);
+    const children = repo.children.get(parent.number) ?? [];
+    repo.children.set(parent.number, [...new Set([...children, child.number])]);
+  }
+
+  async addBlocker(blocked: IssueRef, blocker: IssueRef): Promise<void> {
+    await this.getIssue(blocked.owner, blocked.name, blocked.number);
+    await this.getIssue(blocker.owner, blocker.name, blocker.number);
+    const repo = this.repo(blocked.owner, blocked.name);
+    const blockers = await this.getBlockers(blocked.owner, blocked.name, blocked.number);
+    if (blockers.some((ref) => ref.owner === blocker.owner && ref.name === blocker.name && ref.number === blocker.number)) return;
+    repo.blockedBy.set(blocked.number, [...blockers, blocker]);
   }
 
   async getBlockers(owner: string, name: string, number: number): Promise<Blocker[]> {
