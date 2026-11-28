@@ -1,5 +1,7 @@
+import type { PlanDraft, PlanQuestion } from '../../src/shared/api.ts';
 import type {
   AgentRunner,
+  PlanOutcome,
   ReviewOutcome,
   RunEvent,
   RunMode,
@@ -7,7 +9,8 @@ import type {
   RunRequest,
 } from '../../src/server/agent-runner.ts';
 
-type Handler = (req: RunRequest) => Promise<RunOutcome | ReviewOutcome> | RunOutcome | ReviewOutcome;
+type Outcome = RunOutcome | ReviewOutcome | PlanOutcome;
+type Handler = (req: RunRequest) => Promise<Outcome> | Outcome;
 
 const noUsage = { inputTokens: 0, outputTokens: 0 };
 
@@ -30,6 +33,21 @@ export const approve = (over: Partial<ReviewOutcome> = {}): ReviewOutcome => ({
   usage: noUsage,
   ...over,
 });
+
+// A Planner turn that asks a round of questions (and may already carry a draft).
+export const round = (questions: PlanQuestion[], over: Partial<PlanOutcome> = {}): PlanOutcome => ({
+  kind: 'plan',
+  sessionId: 'fake-planner-session',
+  message: 'A few questions first.',
+  questions,
+  draft: null,
+  usage: noUsage,
+  ...over,
+});
+
+// A Planner turn that asks nothing more and returns the draft.
+export const drafted = (draft: PlanDraft, over: Partial<PlanOutcome> = {}): PlanOutcome =>
+  round([], { message: 'Here is the draft.', draft, ...over });
 
 // Scriptable per call: queue a handler per mode; each start() takes the next one.
 export class FakeAgentRunner implements AgentRunner {

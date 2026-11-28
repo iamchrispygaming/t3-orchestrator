@@ -8,6 +8,9 @@ import type { z } from 'zod';
 import {
   addTargetRepoRequestSchema,
   registerTicketRequestSchema,
+  replyToPlanRequestSchema,
+  settingsSchema,
+  startPlanRequestSchema,
   type ServerEvent,
   type TicketDetail,
 } from '../shared/api.ts';
@@ -17,6 +20,7 @@ import { resolveDataFolder } from './data-folder.ts';
 import { Engine } from './engine.ts';
 import type { GitHub } from './github.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
+import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
 import { Store } from './store.ts';
 
 export type ServerDeps = {
@@ -46,6 +50,14 @@ export function createServer(deps: ServerDeps): Server {
     dataFolder,
     log: deps.log ?? ((message, error) => console.error(message, error)),
   });
+  const planner = new Planner({
+    store,
+    agentRunner: deps.agentRunner,
+    clock: deps.clock ?? systemClock,
+    dataFolder,
+    log: deps.log ?? ((message, error) => console.error(message, error)),
+  });
+  planner.resume();
   const openStreams = new Set<() => void>();
 
   const app = new Hono();
@@ -54,7 +66,11 @@ export function createServer(deps: ServerDeps): Server {
     return schema.safeParse(await body.catch(() => undefined));
   }
 
-  app.onError((error, c) => c.json({ error: error.message }, 500));
+  app.onError((error, c) => {
+    if (error instanceof PlanNotFound) return c.json({ error: error.message }, 404);
+    if (error instanceof PlanBusy) return c.json({ error: error.message }, 409);
+    return c.json({ error: error.message }, 500);
+  });
 
   app.post('/api/repos', async (c) => {
     const req = await parseBody(c.req.json(), addTargetRepoRequestSchema);
@@ -76,19 +92,51 @@ export function createServer(deps: ServerDeps): Server {
     return c.json(detail);
   });
 
+  app.get('/api/settings', (c) => c.json(settingsSchema.parse({ plannerTier: planner.plannerTier() })));
+
+  app.put('/api/settings', async (c) => {
+    const req = await parseBody(c.req.json(), settingsSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    planner.setPlannerTier(req.data.plannerTier);
+    return c.json({ plannerTier: planner.plannerTier() });
+  });
+
+  app.post('/api/plans', async (c) => {
+    const req = await parseBody(c.req.json(), startPlanRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(await planner.start(req.data), 201);
+  });
+
+  app.get('/api/plans', (c) => c.json(planner.plans()));
+
+  app.get('/api/plans/:id', (c) => c.json(planner.plan(Number(c.req.param('id')))));
+
+  app.post('/api/plans/:id/messages', async (c) => {
+    const req = await parseBody(c.req.json(), replyToPlanRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(await planner.reply(Number(c.req.param('id')), req.data));
+  });
+
+  app.delete('/api/plans/:id', async (c) => {
+    await planner.discard(Number(c.req.param('id')));
+    return c.json({ discarded: true });
+  });
+
   app.get('/api/events', (c) =>
     streamSSE(c, async (stream) => {
       let queue = Promise.resolve();
       const send = (event: ServerEvent) => {
         queue = queue.then(() => stream.writeSSE({ event: event.type, data: JSON.stringify(event) }));
       };
-      const unsubscribe = engine.subscribe((ticket) => send({ type: 'ticket', ticket }));
-      send({ type: 'snapshot', tickets: engine.tickets() });
+      const unsubscribeTickets = engine.subscribe((ticket) => send({ type: 'ticket', ticket }));
+      const unsubscribePlans = planner.subscribe(send);
+      send({ type: 'snapshot', tickets: engine.tickets(), plans: planner.plans() });
       await new Promise<void>((resolve) => {
         openStreams.add(resolve);
         stream.onAbort(resolve);
       });
-      unsubscribe();
+      unsubscribeTickets();
+      unsubscribePlans();
       await queue.catch(() => undefined);
     }),
   );
@@ -96,7 +144,7 @@ export function createServer(deps: ServerDeps): Server {
   return {
     app,
     async close() {
-      await engine.stop();
+      await Promise.all([engine.stop(), planner.stop()]);
       for (const end of openStreams) end();
       store.close();
     },

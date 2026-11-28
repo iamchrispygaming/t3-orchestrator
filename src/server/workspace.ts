@@ -1,7 +1,7 @@
 // The repo workspace: per Target Repo a bare clone, per-Ticket worktrees and
 // scratch folders, under `<data>/repos/<owner>/<repo>/{git,work/<n>,scratch/<n>}`.
 import { execFile } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -47,6 +47,26 @@ export class RepoWorkspace {
 
   async commitsAhead(branch: string, defaultBranch: string): Promise<number> {
     return Number(await git(this.gitDir, 'rev-list', '--count', `origin/${defaultBranch}..${branch}`));
+  }
+
+  // A fresh detached checkout of the latest default branch for a Planner session to read.
+  async preparePlannerCheckout(planId: number, defaultBranch: string): Promise<TicketFolders> {
+    const { worktree, scratch } = this.plannerFolders(planId);
+    await git(this.gitDir, 'fetch', '--prune', 'origin');
+    await git(this.gitDir, 'worktree', 'add', '--detach', worktree, `origin/${defaultBranch}`);
+    await mkdir(scratch, { recursive: true });
+    return { worktree, scratch };
+  }
+
+  plannerFolders(planId: number): TicketFolders {
+    return { worktree: join(this.root, 'plan', String(planId)), scratch: join(this.root, 'scratch', `plan-${planId}`) };
+  }
+
+  async removePlannerCheckout(planId: number): Promise<void> {
+    const { worktree, scratch } = this.plannerFolders(planId);
+    await rm(worktree, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true });
+    await git(this.gitDir, 'worktree', 'prune');
   }
 
   // Only the Orchestrator pushes; Agents just commit in their worktree.
