@@ -16,6 +16,7 @@ import {
   type EscalationSettings,
   type ModelTier,
   type ParallelLimits,
+  type PlanDraft,
   type RegisterApprovedPlanRequest,
   type RegisterTicketRequest,
   type RunOutcomeKind,
@@ -34,7 +35,7 @@ import {
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import { deleteRunLogs } from './data-folder.ts';
-import type { FailedJob, GitHub } from './github.ts';
+import type { FailedJob, GitHub, IssueRef, NewIssue } from './github.ts';
 import { DEFAULT_ESCALATION_SETTINGS, nextTier, tierLabel } from './ladder.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
@@ -216,9 +217,51 @@ export class Engine {
     return plan.tickets[0]!;
   }
 
+  async approveDraft(id: number, repoId: number, draft: PlanDraft): Promise<ApprovedPlan> {
+    const { github, store } = this.deps;
+    const repo = store.getTargetRepo(repoId);
+    if (!repo) throw new NotFound(`no Target Repo ${repoId}`);
+    const { owner, name } = repo;
+    return this.withRepoLock(owner, name, async () => {
+      if (!store.getTargetRepo(repoId) || store.isTargetRepoRemoving(repoId)) {
+        throw new Refused(`${repo.owner}/${repo.name} is being removed or was removed`);
+      }
+      const published = store.getPlan(id)!.publishedIssues;
+      async function publish(index: number, issue: NewIssue): Promise<IssueRef> {
+        const saved = published[index];
+        if (saved) return saved;
+        const created = await github.createIssue({ owner, name }, issue);
+        published[index] = created;
+        store.savePublishedIssues(id, published);
+        return created;
+      }
+
+      const spec = await publish(0, draft.spec);
+      const issues = new Map<string, IssueRef>();
+      for (const [index, ticket] of draft.tickets.entries()) {
+        const { agent, model, effort } = ticket.tier;
+        const issue = await publish(index + 1, {
+          title: ticket.title,
+          body: ticket.body,
+          labels: [`model:${agent}:${model}/${effort}`, `door:${ticket.door}`],
+        });
+        issues.set(ticket.key, issue);
+        await github.addSubIssue(spec, issue);
+      }
+      for (const ticket of draft.tickets) {
+        for (const key of new Set(ticket.blockedBy)) await github.addBlocker(issues.get(ticket.key)!, issues.get(key)!);
+      }
+      const approved = await this.registerApprovedPlan({
+        repoId,
+        tickets: draft.tickets.map(({ key, tier, door }) => ({ issueNumber: issues.get(key)!.number, tier, door })),
+      }, id);
+      return { ...approved, spec };
+    });
+  }
+
   // Registers an approved Plan: each Ticket waits on its open blockers, and the
   // Tickets queue in the order given.
-  async registerApprovedPlan(req: RegisterApprovedPlanRequest): Promise<ApprovedPlan> {
+  async registerApprovedPlan(req: RegisterApprovedPlanRequest, draftId?: number): Promise<ApprovedPlan> {
     const { store, github, clock } = this.deps;
     const repo = store.getTargetRepo(req.repoId);
     if (!repo) throw new NotFound(`no Target Repo ${req.repoId}`);
@@ -259,6 +302,7 @@ export class Engine {
       );
       // Only once every Ticket of the Plan exists can blockers inside it be resolved.
       for (const id of ids) if (store.unmetBlockers(id) === 0) store.updateTicket(id, { state: 'ready' });
+      if (draftId !== undefined) store.markPlanApproved(draftId, plan.id);
       return { plan, ids };
     });
 

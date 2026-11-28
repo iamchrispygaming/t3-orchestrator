@@ -11,6 +11,7 @@ import {
   ticketDetailSchema,
   ticketSchema,
   type AddTargetRepoRequest,
+  type EditPlanDraftRequest,
   type RegisterApprovedPlanRequest,
   type RegisterTicketRequest,
   type ReplyToPlanRequest,
@@ -78,8 +79,14 @@ export function createApiClient(fetchFn: FetchFn) {
     async getPlan(id: number) {
       return planSchema.parse(await call(`/api/plans/${id}`));
     },
+    async editPlanDraft(id: number, req: EditPlanDraftRequest) {
+      return planSchema.parse(await send('PATCH', `/api/plans/${id}/draft`, req));
+    },
     async replyToPlan(id: number, req: ReplyToPlanRequest) {
       return planSchema.parse(await post(`/api/plans/${id}/messages`, req));
+    },
+    async approvePlan(id: number) {
+      return approvedPlanSchema.parse(await post(`/api/plans/${id}/approve`, {}));
     },
     async discardPlan(id: number) {
       await call(`/api/plans/${id}`, { method: 'DELETE' });

@@ -390,6 +390,138 @@ describe('the Planner interview', () => {
     expect(after.messages.filter((m) => m.from === 'planner' && m.round)).toHaveLength(1);
   });
 
+  it('saves direct text, Model Tier and door edits and publishes the draft over SSE', async () => {
+    agent.script('plan', () => drafted(draft));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+
+    const edits = {
+      spec: { body: 'Say hello and link to it.' },
+      ticket: {
+        key: 'T1',
+        title: 'Add a greeting',
+        body: 'Write a greeting in hello.txt.',
+        tier: opusHigh,
+        door: 'one-way' as const,
+      },
+    };
+    const edited = await api.editPlanDraft(plan.id, edits);
+    expect(await settled(events, plan.id)).toEqual(edited);
+    await events.close();
+    expect(edited.draft).toEqual({
+      spec: { title: 'Greetings', body: edits.spec.body },
+      tickets: [
+        { ...draft.tickets[0], ...edits.ticket, tierReason: '' },
+        draft.tickets[1],
+      ],
+    });
+    for (const server of servers.splice(0)) await server.close();
+    expect(await start().getPlan(plan.id)).toEqual(edited);
+    expect(agent.calls).toHaveLength(1);
+    expect(github.issueCount('acme', 'widgets')).toBe(0);
+  });
+
+  it('redraws the current draft through the Planner when the user asks to merge Tickets', async () => {
+    const redrawn = { ...draft, tickets: [{ ...draft.tickets[0]!, body: 'Write and link hello.txt.' }] };
+    agent
+      .script('plan', () => drafted(draft, { sessionId: 'planner-1' }))
+      .script('plan', (req) => {
+        expect(req.resumeSessionId).toBe('planner-1');
+        expect(req.instructions).toContain('Merge the two Tickets.');
+        expect(req.instructions).toContain('Use a friendlier greeting.');
+        return drafted(redrawn, { sessionId: 'planner-1' });
+      });
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+    await api.editPlanDraft(plan.id, { ticket: { key: 'T1', body: 'Use a friendlier greeting.' } });
+    await settled(events, plan.id);
+
+    await api.replyToPlan(plan.id, { text: 'Merge the two Tickets.' });
+    const updated = await settled(events, plan.id);
+    await events.close();
+    expect(updated.status).toBe('drafted');
+    expect(updated.draft).toEqual(redrawn);
+    expect(github.issueCount('acme', 'widgets')).toBe(0);
+  });
+
+  it('publishes the Spec, Ticket sub-issues, native blockers and labels before queueing', async () => {
+    agent.script('plan', () => drafted(draft));
+    agent.script('run', (req) => new Promise((_, reject) => {
+      req.signal.throwIfAborted();
+      req.signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
+    }));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+    await api.editPlanDraft(plan.id, { ticket: { key: 'T2', door: 'one-way', title: 'Link the greeting' } });
+    expect(github.issueCount('acme', 'widgets')).toBe(0);
+
+    const approved = await api.approvePlan(plan.id);
+    const [first, second] = approved.tickets;
+    expect(approved).toMatchObject({ spec: { owner: 'acme', name: 'widgets', number: 1000 } });
+    const spec = 1000;
+    expect(github.issue('acme', 'widgets', spec)).toMatchObject(draft.spec);
+    expect(github.subIssues('acme', 'widgets', spec)).toEqual([first!.issueNumber, second!.issueNumber]);
+    expect(github.issue('acme', 'widgets', first!.issueNumber)).toMatchObject({
+      title: 'Add hello.txt', body: 'Write hello.txt.', labels: ['model:claude:haiku/medium', 'door:two-way'],
+    });
+    expect(github.issue('acme', 'widgets', second!.issueNumber)).toMatchObject({
+      title: 'Link the greeting', body: 'Add a link.', labels: ['model:codex:gpt-6.2-sol/low', 'door:one-way'],
+    });
+    expect(await github.getBlockers('acme', 'widgets', second!.issueNumber)).toEqual([
+      { owner: 'acme', name: 'widgets', number: first!.issueNumber, merged: false },
+    ]);
+
+    let running = false;
+    let published = false;
+    while (!running || !published) {
+      const event = await events.next();
+      if (event.type === 'ticket' && event.ticket.id === first!.id && event.ticket.state === 'running') running = true;
+      if (event.type === 'plan' && event.plan.id === plan.id && event.plan.status === 'approved') published = true;
+    }
+    await events.close();
+    expect((await api.getTicket(second!.id)).state).toBe('waiting');
+    await expect(api.approvePlan(plan.id)).rejects.toThrow(/409/);
+    expect(github.issueCount('acme', 'widgets')).toBe(3);
+  });
+
+  it('retries partial publication after a restart without duplicating issues or queueing early', async () => {
+    agent.script('plan', () => drafted(draft));
+    agent.script('run', (req) => new Promise((_, reject) => {
+      req.signal.throwIfAborted();
+      req.signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
+    }));
+    let api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+    await events.close();
+
+    github.failNextSubIssue();
+    await expect(api.approvePlan(plan.id)).rejects.toThrow(/temporarily unavailable/);
+    expect(github.issueCount('acme', 'widgets')).toBe(2);
+    const snapshot = await api.events();
+    expect(await snapshot.next()).toMatchObject({ type: 'snapshot', tickets: [] });
+    await snapshot.close();
+    for (const server of servers.splice(0)) await server.close();
+
+    api = start();
+    const approved = await api.approvePlan(plan.id);
+    expect(await api.getPlan(plan.id)).toMatchObject({ status: 'approved', approvedPlanId: approved.id, specIssue: approved.spec });
+    expect(approved.spec?.number).toBe(1000);
+    expect(approved.tickets.map((t) => t.issueNumber)).toEqual([1001, 1002]);
+    expect(github.issueCount('acme', 'widgets')).toBe(3);
+  });
+
   it('marks a turn failed when the Planner crashes, and a reply retries it', async () => {
     agent
       .script('plan', () => {

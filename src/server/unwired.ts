@@ -13,6 +13,9 @@ const refuse = (what: string) => async (): Promise<never> => {
 export const unwiredGitHub: GitHub = {
   getRepo: refuse('GitHub'),
   getIssue: refuse('GitHub'),
+  createIssue: refuse('GitHub'),
+  addSubIssue: refuse('GitHub'),
+  addBlocker: refuse('GitHub'),
   createPullRequest: refuse('GitHub'),
   updatePullRequest: refuse('GitHub'),
   markPullRequestReady: refuse('GitHub'),

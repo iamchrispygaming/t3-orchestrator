@@ -47,9 +47,8 @@ const ticketEntrySchema = z.object({
 export const registerTicketRequestSchema = ticketEntrySchema.extend({ repoId: z.number().int() });
 export type RegisterTicketRequest = z.infer<typeof registerTicketRequestSchema>;
 
-// A hand-made Plan of existing issues, approved on registration (until Plan
-// approval publishes drafts, #38). Its Tickets queue in the order given; their
-// blockers come from GitHub's native dependencies.
+// A hand-made Plan of existing issues, approved on registration. Its Tickets
+// queue in the order given. Their blockers come from GitHub's native dependencies.
 export const registerApprovedPlanRequestSchema = z.object({
   repoId: z.number().int(),
   tickets: z.array(ticketEntrySchema).min(1),
@@ -71,10 +70,13 @@ export const ticketSchema = z.object({
 });
 export type Ticket = z.infer<typeof ticketSchema>;
 
+const issueRefSchema = z.object({ owner: z.string(), name: z.string(), number: z.number().int().positive() });
+
 export const approvedPlanSchema = z.object({
   id: z.number().int(),
   repoId: z.number().int(),
   approvedAt: z.iso.datetime(),
+  spec: issueRefSchema.optional(),
   tickets: z.array(ticketSchema),
 });
 export type ApprovedPlan = z.infer<typeof approvedPlanSchema>;
@@ -150,6 +152,17 @@ export const planDraftSchema = z.object({
 });
 export type PlanDraft = z.infer<typeof planDraftSchema>;
 
+export const editPlanDraftRequestSchema = z.strictObject({
+  spec: planDraftSchema.shape.spec.partial().strict().optional(),
+  ticket: planDraftSchema.shape.tickets.element
+    .pick({ title: true, body: true, tier: true, door: true })
+    .partial()
+    .extend({ key: z.string().min(1) })
+    .strict()
+    .optional(),
+});
+export type EditPlanDraftRequest = z.infer<typeof editPlanDraftRequestSchema>;
+
 export const planQuestionSchema = z.object({ question: z.string().min(1), recommended: z.string() });
 export type PlanQuestion = z.infer<typeof planQuestionSchema>;
 
@@ -169,7 +182,8 @@ export type PlanMessage = z.infer<typeof planMessageSchema>;
 
 // thinking: the Planner's turn. asking: a round waits for answers.
 // drafted: a draft and no open questions. failed: the last turn broke; replying retries.
-export const planStatusSchema = z.enum(['thinking', 'asking', 'drafted', 'failed']);
+// publishing: approval has started and can be retried. approved: the Tickets are queued.
+export const planStatusSchema = z.enum(['thinking', 'asking', 'drafted', 'failed', 'publishing', 'approved']);
 export type PlanStatus = z.infer<typeof planStatusSchema>;
 
 export const planSchema = z.object({
@@ -179,6 +193,8 @@ export const planSchema = z.object({
   status: planStatusSchema,
   createdAt: z.iso.datetime(),
   draft: planDraftSchema.nullable(),
+  approvedPlanId: z.number().int().optional(),
+  specIssue: issueRefSchema.optional(),
   messages: z.array(planMessageSchema),
 });
 export type Plan = z.infer<typeof planSchema>;

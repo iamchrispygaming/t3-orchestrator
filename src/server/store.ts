@@ -1,6 +1,6 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
-import type { Blocker } from './github.ts';
+import type { Blocker, IssueRef } from './github.ts';
 import type {
   Door,
   ModelTier,
@@ -119,6 +119,8 @@ const migrations: string[] = [
   `ALTER TABLE runs ADD COLUMN failure_note TEXT;
    ALTER TABLE tickets ADD COLUMN handback_reason TEXT;
    ALTER TABLE tickets ADD COLUMN published_head TEXT;`,
+  `ALTER TABLE plans ADD COLUMN approved_plan_id INTEGER REFERENCES approved_plans(id);
+   ALTER TABLE plans ADD COLUMN published_issues TEXT;`,
 ];
 
 // Run outcomes that are not failures: the next Run's instructions skip past them
@@ -151,6 +153,8 @@ export type StoredPlan = {
   createdAt: string;
   sessionId: string | null;
   draft: PlanDraft | null;
+  approvedPlanId?: number;
+  publishedIssues: IssueRef[]; // Spec first, then Tickets in draft order
 };
 
 export class Store {
@@ -468,6 +472,14 @@ export class Store {
     if (change.draft !== undefined) this.db.prepare('UPDATE plans SET draft = ? WHERE id = ?').run(JSON.stringify(change.draft), id);
   }
 
+  savePublishedIssues(id: number, issues: IssueRef[]): void {
+    this.db.prepare('UPDATE plans SET published_issues = ? WHERE id = ?').run(JSON.stringify(issues), id);
+  }
+
+  markPlanApproved(id: number, approvedPlanId: number): void {
+    this.db.prepare("UPDATE plans SET status = 'approved', approved_plan_id = ? WHERE id = ?").run(approvedPlanId, id);
+  }
+
   deletePlan(id: number): void {
     this.db.prepare('DELETE FROM plans WHERE id = ?').run(id);
   }
@@ -519,6 +531,8 @@ function toPlan(row: Row): StoredPlan {
     status: String(row.status) as PlanStatus,
     createdAt: String(row.created_at),
     sessionId: row.session_id == null ? null : String(row.session_id),
+    publishedIssues: row.published_issues == null ? [] : (JSON.parse(String(row.published_issues)) as IssueRef[]),
+    ...(row.approved_plan_id == null ? {} : { approvedPlanId: Number(row.approved_plan_id) }),
     draft: row.draft == null ? null : (JSON.parse(String(row.draft)) as PlanDraft),
   };
 }
