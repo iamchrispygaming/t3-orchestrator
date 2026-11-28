@@ -1,6 +1,7 @@
 // The repo workspace: per Target Repo a bare clone, per-Ticket worktrees and
 // scratch folders, under `<data>/repos/<owner>/<repo>/{git,work/<n>,scratch/<n>}`.
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -56,11 +57,14 @@ export class RepoWorkspace {
   }
 
   // A fresh worktree for the Ticket on `branch`, reset to the latest default branch.
+  // An earlier Run's worktree (and its commits on `branch`) is thrown away first.
   prepareTicket(issueNumber: number, branch: string, defaultBranch: string): Promise<TicketFolders> {
     return serially(this.gitDir, async () => {
       const worktree = join(this.root, 'work', String(issueNumber));
       const scratch = join(this.root, 'scratch', String(issueNumber));
       await git(this.gitDir, 'fetch', '--prune', 'origin');
+      if (existsSync(worktree)) await git(this.gitDir, 'worktree', 'remove', '--force', worktree);
+      await git(this.gitDir, 'worktree', 'prune');
       await git(this.gitDir, 'worktree', 'add', '-B', branch, worktree, `origin/${defaultBranch}`);
       await mkdir(scratch, { recursive: true });
       return { worktree, scratch };

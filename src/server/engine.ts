@@ -31,6 +31,9 @@ import { deleteRunLogs } from './data-folder.ts';
 import type { GitHub } from './github.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
+import { DEFAULT_LADDER, nextTierOf, otherAgent } from './ladder.ts';
+import { Quota } from './quota.ts';
+import { priced } from './usage.ts';
 import { RepoWorkspace, type TicketFolders } from './workspace.ts';
 
 export const RUN_TIME_LIMIT_MS = 60 * 60_000;
@@ -58,6 +61,9 @@ export type EngineDeps = {
 
 type Call = 'one-way' | 'two-way' | 'unclear';
 
+// How the Agent's side of a Run or Review ended.
+type AgentEnd<T> = { kind: 'result'; result: T } | { kind: 'quota-hit' };
+
 // Any one-way call wins; an unclear call counts as one-way.
 function mostCautious(...calls: Call[]): Door {
   return calls.every((c) => c === 'two-way') ? 'two-way' : 'one-way';
@@ -74,7 +80,7 @@ export function branchName(issueNumber: number, title: string): string {
   return `t3o/${issueNumber}-${slug || 'issue'}`;
 }
 
-function publicTicket({ body: _body, ...ticket }: StoredTicket): Ticket {
+function publicTicket({ body: _body, pausedFrom: _pausedFrom, quotaHold: _quotaHold, ...ticket }: StoredTicket): Ticket {
   return ticket;
 }
 
@@ -89,9 +95,11 @@ export class Engine {
   private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
   private repoLocks = new Map<string, Promise<void>>();
   private deps: EngineDeps;
+  private quota: Quota;
 
   constructor(deps: EngineDeps) {
     this.deps = deps;
+    this.quota = new Quota(deps.store, deps.clock, () => this.quotaFreed());
   }
 
   subscribe(listener: (ticket: Ticket) => void): () => void {
@@ -157,6 +165,19 @@ export class Engine {
       await deleteRunLogs(dataFolder, store.listRunIds(id));
       store.markTargetRepoRemoved(id, clock.now());
     });
+  }
+
+  // The user's override: a Paused Ticket returns to its previous state and its next
+  // Run starts at its own Model Tier whatever the quota readings say.
+  resumeTicket(id: number): Ticket {
+    const { store } = this.deps;
+    const ticket = store.getTicket(id);
+    if (!ticket) throw new NotFound(`no Ticket ${id}`);
+    if (ticket.state !== 'paused') throw new Refused(`Ticket ${id} is not Paused`);
+    store.updateTicket(id, { state: ticket.pausedFrom ?? 'ready', pausedFrom: null, quotaHold: 'override' });
+    this.emit(id);
+    this.schedule();
+    return publicTicket(store.getTicket(id)!);
   }
 
   ticket(id: number): Ticket | undefined {
@@ -231,9 +252,16 @@ export class Engine {
     return limits;
   }
 
+  // At startup: arms the quota timers and resumes Tickets whose quota freed while the server was down.
+  start(): void {
+    this.quota.start();
+    this.quotaFreed();
+  }
+
   // Stops in-flight Runs and waits for them to wind down.
   async stop(): Promise<void> {
     this.stopping.abort();
+    this.quota.stop();
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
   }
 
@@ -276,12 +304,43 @@ export class Engine {
     const { store } = this.deps;
     const limits = store.parallelLimits();
     for (const ticket of store.readyQueue()) {
-      const agent = ticket.tier.agent;
+      const tier = this.route(ticket);
+      if (!tier) {
+        store.updateTicket(ticket.id, { pausedFrom: 'ready' });
+        this.setState(ticket.id, 'paused');
+        continue;
+      }
+      const agent = tier.agent;
       if (this.slotsInUse[agent] >= limits[agent]) continue;
       this.slotsInUse[agent]++;
+      // The override and the hold cover one start only.
+      store.updateTicket(ticket.id, { tier, quotaHold: null });
       this.setState(ticket.id, 'running');
       this.track(this.work(ticket.id));
     }
+  }
+
+  // Routing at run time: the Ticket's own Model Tier, unless its Agent is near its
+  // quota limit; then the other Agent's next more capable tier on the Ladder. None
+  // that can start (that Agent is near its limit too, or there is no tier above): Paused.
+  // A Run its quota cut short waits for that Agent and reruns at the same tier.
+  private route(ticket: StoredTicket): ModelTier | undefined {
+    if (ticket.quotaHold === 'override' || !this.quota.nearLimit(ticket.tier.agent)) return ticket.tier;
+    if (ticket.quotaHold === 'same-tier') return undefined;
+    const other = nextTierOf(DEFAULT_LADDER, ticket.tier, otherAgent(ticket.tier.agent));
+    return other && !this.quota.nearLimit(other.agent) ? other : undefined;
+  }
+
+  // Quota freed: every Paused Ticket that could start now returns to its previous state.
+  private quotaFreed(): void {
+    if (this.stopping.signal.aborted) return;
+    const { store } = this.deps;
+    for (const ticket of store.pausedTickets()) {
+      if (!this.route(ticket)) continue;
+      store.updateTicket(ticket.id, { state: ticket.pausedFrom ?? 'ready', pausedFrom: null });
+      this.emit(ticket.id);
+    }
+    this.schedule();
   }
 
   private freeSlot(agent: Agent): void {
@@ -331,17 +390,26 @@ export class Engine {
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
 
     let folders: TicketFolders;
-    let run: RunOutcome;
+    let end: AgentEnd<RunOutcome>;
     try {
       folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
       const runId = store.startRun(id, ticket.tier, clock.now());
       this.emit(id);
-      run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
-      store.endRun(runId, clock.now(), run.status, run.reason);
+      end = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
+      if (end.kind === 'quota-hit') store.endRun(runId, clock.now(), 'quota-hit', "the Agent's quota ran out mid-Run");
+      else store.endRun(runId, clock.now(), end.result.status, end.result.reason, priced(ticket.tier, end.result.usage));
       this.emit(id);
     } finally {
       this.freeSlot(ticket.tier.agent);
     }
+    if (end.kind === 'quota-hit') {
+      // Not a failure: back in the queue to rerun at the same Model Tier once this Agent's quota frees.
+      store.updateTicket(id, { quotaHold: 'same-tier' });
+      this.setState(id, 'ready');
+      this.schedule();
+      return;
+    }
+    const run = end.result;
     if (run.status !== 'done') throw new NotYetHandled(`Run ended ${run.status}: ${run.reason}`);
     if ((await workspace.commitsAhead(ticket.branch, repo.defaultBranch)) === 0) {
       throw new NotYetHandled('Run made no commits');
@@ -364,8 +432,10 @@ export class Engine {
     const reviewTier = ticket.tier;
     const reviewId = store.startReview(id, reviewTier, clock.now());
     this.emit(id);
-    const review = await this.runAgent('review', reviewTier, folders.worktree, folders.scratch, reviewOutcomeSchema, ticket);
-    store.endReview(reviewId, clock.now(), review.verdict, review.findings);
+    const reviewEnd = await this.runAgent('review', reviewTier, folders.worktree, folders.scratch, reviewOutcomeSchema, ticket);
+    if (reviewEnd.kind === 'quota-hit') throw new NotYetHandled("the reviewer's quota ran out mid-Review");
+    const review = reviewEnd.result;
+    store.endReview(reviewId, clock.now(), review.verdict, review.findings, priced(reviewTier, review.usage));
     this.emit(id);
     if (review.verdict !== 'approve') throw new NotYetHandled(`Review verdict ${review.verdict}`);
 
@@ -381,7 +451,7 @@ export class Engine {
     scratchDir: string,
     schema: S,
     ticket: StoredTicket,
-  ): Promise<z.infer<S>> {
+  ): Promise<AgentEnd<z.infer<S>>> {
     const events = this.deps.agentRunner.start({
       tier,
       cwd,
@@ -392,10 +462,22 @@ export class Engine {
       timeoutMs: RUN_TIME_LIMIT_MS,
       signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(RUN_TIME_LIMIT_MS)]),
     });
+    // A `rejected` reading, once seen, is the outcome: the quota ran out, whatever the Agent reports after.
+    let quotaHit = false;
+    let result: z.infer<S> | undefined;
     for await (const event of events) {
       if (event.type === 'text') this.emitOutput(ticket.id, event.text);
-      if (event.type === 'result') return schema.parse(event.result);
+      if (event.type === 'rate-limit') {
+        this.quota.record(event);
+        if (event.status === 'rejected' && event.agent === tier.agent) quotaHit = true;
+      }
+      if (event.type === 'result') {
+        result = schema.parse(event.result);
+        break;
+      }
     }
+    if (quotaHit) return { kind: 'quota-hit' };
+    if (result !== undefined) return { kind: 'result', result };
     throw new NotYetHandled(`${mode} ended without a result`);
   }
 }

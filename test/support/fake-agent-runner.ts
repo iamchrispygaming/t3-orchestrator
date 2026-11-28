@@ -10,7 +10,19 @@ import type {
 } from '../../src/server/agent-runner.ts';
 
 type Outcome = RunOutcome | ReviewOutcome | PlanOutcome;
-type Handler = (req: RunRequest) => Promise<Outcome> | Outcome;
+// Events the fake Agent streams before its result; no result means the stream ends without one.
+type Streamed = { events: RunEvent[]; result?: Outcome };
+type Handler = (req: RunRequest) => Promise<Outcome | Streamed> | Outcome | Streamed;
+
+// A Run that streams `events` first, then ends with `result` (or with no result).
+export const streaming = (events: RunEvent[], result?: Outcome): Streamed => (result ? { events, result } : { events });
+
+// A quota reading, as the adapters report it mid-Run.
+export const rateLimit = (
+  agent: 'claude' | 'codex',
+  status: 'allowed' | 'near-limit' | 'rejected',
+  resetsAt?: Date,
+): RunEvent => ({ type: 'rate-limit', agent, status, ...(resetsAt ? { resetsAt: resetsAt.toISOString() } : {}) });
 
 const noUsage = { inputTokens: 0, outputTokens: 0 };
 
@@ -73,6 +85,12 @@ export class FakeAgentRunner implements AgentRunner {
     const handler = this.queues.get(req.mode)?.shift() ?? this.fallbacks.get(req.mode);
     if (!handler) throw new Error(`fake AgentRunner has no script left for a ${req.mode}`);
     yield { type: 'text', text: `fake ${req.mode} started` };
-    yield { type: 'result', result: await handler(req) };
+    const outcome = await handler(req);
+    if (!('events' in outcome)) {
+      yield { type: 'result', result: outcome };
+      return;
+    }
+    yield* outcome.events;
+    if (outcome.result) yield { type: 'result', result: outcome.result };
   }
 }

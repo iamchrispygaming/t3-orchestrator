@@ -1,7 +1,9 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
 import type { Blocker } from './github.ts';
+import type { QuotaReading } from './quota.ts';
 import type {
+  Agent,
   Door,
   ModelTier,
   ParallelLimits,
@@ -113,13 +115,30 @@ const migrations: string[] = [
    UPDATE target_repos SET removed_at = '1970-01-01T00:00:00.000Z'
      WHERE id NOT IN (SELECT min(id) FROM target_repos GROUP BY lower(owner), lower(name));
    CREATE UNIQUE INDEX target_repos_live ON target_repos (lower(owner), lower(name)) WHERE removed_at IS NULL;`,
+  // Usage and Cost per Run and Review (kept forever), the last quota reading per
+  // Agent, and what a Paused Ticket returns to.
+  `ALTER TABLE runs ADD COLUMN input_tokens INTEGER;
+   ALTER TABLE runs ADD COLUMN output_tokens INTEGER;
+   ALTER TABLE runs ADD COLUMN cost_usd REAL; -- NULL: no usage reported, or no price for the model
+   ALTER TABLE reviews ADD COLUMN input_tokens INTEGER;
+   ALTER TABLE reviews ADD COLUMN output_tokens INTEGER;
+   ALTER TABLE reviews ADD COLUMN cost_usd REAL;
+   CREATE TABLE quota_readings (
+     agent TEXT PRIMARY KEY,
+     status TEXT NOT NULL,
+     resets_at TEXT,
+     utilization REAL,
+     seen_at TEXT NOT NULL
+   );
+   ALTER TABLE tickets ADD COLUMN paused_from TEXT;
+   ALTER TABLE tickets ADD COLUMN quota_hold TEXT;`,
 ];
 
 export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
 
 export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
 
-export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber'> & {
+export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber' | 'pausedFrom' | 'quotaHold'> & {
   planId: number;
   planPosition: number;
   blockers: Blocker[];
@@ -130,7 +149,16 @@ type Row = Record<string, unknown>;
 const SELECT_TICKETS = `SELECT t.*, r.owner || '/' || r.name AS repo
   FROM tickets t JOIN target_repos r ON r.id = t.repo_id`;
 
-export type StoredTicket = Ticket & { body: string };
+// How Routing treats a Ticket's next Run despite quota: 'same-tier' after a quota hit
+// mid-Run (wait for this Agent, never move); 'override' after a manual resume (start now).
+export type QuotaHold = 'same-tier' | 'override';
+
+export type StoredTicket = Ticket & { body: string; pausedFrom: TicketState | null; quotaHold: QuotaHold | null };
+
+// One Run's or Review's usage, with its Cost when it could be priced.
+export type UsageRecord = { inputTokens: number; outputTokens: number; costUsd: number | null };
+
+export type CostHistoryRow = { kind: 'run' | 'review'; tier: ModelTier; costUsd: number };
 
 export type StoredPlan = {
   id: number;
@@ -339,8 +367,20 @@ export class Store {
     return (this.db.prepare(`${SELECT_TICKETS} WHERE t.repo_id = ? ORDER BY t.id`).all(repoId) as Row[]).map(toTicket);
   }
 
-  updateTicket(id: number, change: { state?: TicketState; prNumber?: number }): void {
+  updateTicket(
+    id: number,
+    change: {
+      state?: TicketState;
+      prNumber?: number;
+      tier?: ModelTier;
+      pausedFrom?: TicketState | null;
+      quotaHold?: QuotaHold | null;
+    },
+  ): void {
     if (change.state !== undefined) this.db.prepare('UPDATE tickets SET state = ? WHERE id = ?').run(change.state, id);
+    if (change.tier !== undefined) this.db.prepare('UPDATE tickets SET tier = ? WHERE id = ?').run(JSON.stringify(change.tier), id);
+    if (change.pausedFrom !== undefined) this.db.prepare('UPDATE tickets SET paused_from = ? WHERE id = ?').run(change.pausedFrom, id);
+    if (change.quotaHold !== undefined) this.db.prepare('UPDATE tickets SET quota_hold = ? WHERE id = ?').run(change.quotaHold, id);
     if (change.prNumber !== undefined) this.db.prepare('UPDATE tickets SET pr_number = ? WHERE id = ?').run(change.prNumber, id);
   }
 
@@ -351,10 +391,51 @@ export class Store {
     return Number(lastInsertRowid);
   }
 
-  endRun(id: number, endedAt: Date, outcome: NonNullable<RunRecord['outcome']>, reason: string): void {
+  endRun(id: number, endedAt: Date, outcome: NonNullable<RunRecord['outcome']>, reason: string, usage?: UsageRecord): void {
     this.db
-      .prepare('UPDATE runs SET ended_at = ?, outcome = ?, reason = ? WHERE id = ?')
-      .run(endedAt.toISOString(), outcome, reason, id);
+      .prepare('UPDATE runs SET ended_at = ?, outcome = ?, reason = ?, input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?')
+      .run(endedAt.toISOString(), outcome, reason, usage?.inputTokens ?? null, usage?.outputTokens ?? null, usage?.costUsd ?? null, id);
+  }
+
+  pausedTickets(): StoredTicket[] {
+    return (this.db.prepare(`${SELECT_TICKETS} WHERE t.state = 'paused' ORDER BY t.id`).all() as Row[]).map(toTicket);
+  }
+
+  // Every priced Run and Review ever, removed Target Repos' included.
+  costHistory(): CostHistoryRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT 'run' AS kind, tier, cost_usd, 0 AS source, id FROM runs WHERE cost_usd IS NOT NULL
+         UNION ALL SELECT 'review' AS kind, tier, cost_usd, 1 AS source, id FROM reviews WHERE cost_usd IS NOT NULL
+         ORDER BY source, id`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({
+      kind: r.kind as CostHistoryRow['kind'],
+      tier: JSON.parse(String(r.tier)) as ModelTier,
+      costUsd: Number(r.cost_usd),
+    }));
+  }
+
+  getQuotaReading(agent: Agent): QuotaReading | undefined {
+    const row = this.db.prepare('SELECT * FROM quota_readings WHERE agent = ?').get(agent) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      status: String(row.status) as QuotaReading['status'],
+      ...(row.resets_at == null ? {} : { resetsAt: String(row.resets_at) }),
+      ...(row.utilization == null ? {} : { utilization: Number(row.utilization) }),
+      seenAt: String(row.seen_at),
+    };
+  }
+
+  setQuotaReading(agent: Agent, reading: QuotaReading): void {
+    this.db
+      .prepare(
+        `INSERT INTO quota_readings (agent, status, resets_at, utilization, seen_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (agent) DO UPDATE SET status = excluded.status, resets_at = excluded.resets_at,
+           utilization = excluded.utilization, seen_at = excluded.seen_at`,
+      )
+      .run(agent, reading.status, reading.resetsAt ?? null, reading.utilization ?? null, reading.seenAt);
   }
 
   listRuns(ticketId: number): RunRecord[] {
@@ -375,10 +456,10 @@ export class Store {
     return Number(lastInsertRowid);
   }
 
-  endReview(id: number, endedAt: Date, verdict: NonNullable<ReviewRecord['verdict']>, findings: string): void {
+  endReview(id: number, endedAt: Date, verdict: NonNullable<ReviewRecord['verdict']>, findings: string, usage?: UsageRecord): void {
     this.db
-      .prepare('UPDATE reviews SET ended_at = ?, verdict = ?, findings = ? WHERE id = ?')
-      .run(endedAt.toISOString(), verdict, findings, id);
+      .prepare('UPDATE reviews SET ended_at = ?, verdict = ?, findings = ?, input_tokens = ?, output_tokens = ?, cost_usd = ? WHERE id = ?')
+      .run(endedAt.toISOString(), verdict, findings, usage?.inputTokens ?? null, usage?.outputTokens ?? null, usage?.costUsd ?? null, id);
   }
 
   listReviews(ticketId: number): ReviewRecord[] {
@@ -497,5 +578,7 @@ function toTicket(row: Row): StoredTicket {
     door: String(row.door) as Door,
     state: String(row.state) as TicketState,
     prNumber: row.pr_number == null ? null : Number(row.pr_number),
+    pausedFrom: row.paused_from == null ? null : (String(row.paused_from) as TicketState),
+    quotaHold: row.quota_hold == null ? null : (String(row.quota_hold) as QuotaHold),
   };
 }

@@ -14,6 +14,7 @@ const RUN_OUTCOMES: Record<NonNullable<TicketDetail['runs'][number]['outcome']>,
   failed: 'failed',
   cannot: 'judged it impossible',
   'needs-permission': 'needs a permission',
+  'quota-hit': 'stopped by quota',
 };
 
 const VERDICTS: Record<NonNullable<TicketDetail['reviews'][number]['verdict']>, string> = {

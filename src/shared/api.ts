@@ -15,7 +15,9 @@ export type Door = z.infer<typeof doorSchema>;
 export const agentSchema = modelTierSchema.shape.agent;
 export type Agent = z.infer<typeof agentSchema>;
 
-export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged']);
+// paused: quota holds it (every Agent near its limit, or its own Agent ran out
+// mid-Run); it returns to its previous state when quota frees or the user resumes it.
+export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'paused']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
 // A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is
@@ -91,7 +93,8 @@ export const runRecordSchema = z.object({
   tier: modelTierSchema,
   startedAt: z.iso.datetime(),
   endedAt: z.iso.datetime().nullable(),
-  outcome: z.enum(['done', 'failed', 'cannot', 'needs-permission']).nullable(),
+  // quota-hit: the Agent's quota ran out mid-Run; not a failure, so no Model Tier is used up.
+  outcome: z.enum(['done', 'failed', 'cannot', 'needs-permission', 'quota-hit']).nullable(),
   reason: z.string().nullable(), // why it failed; null while running or when it succeeded
 });
 export type RunRecord = z.infer<typeof runRecordSchema>;
