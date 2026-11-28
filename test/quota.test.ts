@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -218,15 +218,23 @@ describe('usage, Cost and quota', () => {
     ]);
   });
 
-  it('keeps every Run and Review priced as Cost and tells the Planner the estimate per Model Tier, never the UI', async () => {
+  // The Planner's first turn, once the Plan is asking.
+  async function plannerInstructions(repoId: number): Promise<string> {
+    agent.script('plan', () => round([{ question: 'Which file?', recommended: 'hello.txt' }]));
+    const plan = await api.startPlan({ repoId, idea: 'Add a greeting.' });
+    await until(async () => (await api.getPlan(plan.id)).status === 'asking');
+    return agent.calls.filter((c) => c.mode === 'plan').at(-1)!.instructions;
+  }
+
+  it('keeps every Run and Review priced as Cost and gives the Planner relative Cost per Model Tier, never dollars', async () => {
     const repo = await addRepo();
     // Claude reports dollars; Codex reports tokens, priced at gpt-6.2-sol's $2 in / $10 out per million.
     runUsage.set(1, { inputTokens: 50_000, outputTokens: 4_000, costUsd: 0.3 });
-    reviewUsage.set(1, { inputTokens: 9_000, outputTokens: 500, costUsd: 0.05 });
+    reviewUsage.set(1, { inputTokens: 9_000, outputTokens: 500, costUsd: 0.06 });
     runUsage.set(2, { inputTokens: 70_000, outputTokens: 6_000, costUsd: 0.5 });
-    reviewUsage.set(2, { inputTokens: 9_000, outputTokens: 500, costUsd: 0.05 });
-    runUsage.set(3, { inputTokens: 100_000, outputTokens: 20_000 });
-    reviewUsage.set(3, { inputTokens: 10_000, outputTokens: 1_000 });
+    reviewUsage.set(2, { inputTokens: 9_000, outputTokens: 500, costUsd: 0.06 });
+    runUsage.set(3, { inputTokens: 200_000, outputTokens: 40_000 }); // $0.80
+    reviewUsage.set(3, { inputTokens: 20_000, outputTokens: 2_000 }); // $0.06
     await (await register(repo.id, 1)).merged;
     const second = await register(repo.id, 2);
     await second.merged;
@@ -235,21 +243,111 @@ describe('usage, Cost and quota', () => {
     // Kept across a restart: the estimate comes from everything on record.
     await stop();
     await start();
-    agent.script('plan', () => round([{ question: 'Which file?', recommended: 'hello.txt' }]));
-    const plan = await api.startPlan({ repoId: repo.id, idea: 'Add a greeting.' });
-    await until(async () => (await api.getPlan(plan.id)).status === 'asking');
+    const instructions = await plannerInstructions(repo.id);
 
-    const instructions = agent.calls.find((c) => c.mode === 'plan')!.instructions;
+    // Medians against the cheapest Run on record (claude:haiku at $0.40).
     expect(instructions).toContain(
       [
-        'Cost so far per Model Tier (median, at API list prices):',
-        '- claude:haiku/medium: $0.40 per Run (2 Runs), $0.05 per Review (2 Reviews)',
-        '- codex:gpt-6.2-sol/low: $0.40 per Run (1 Run), $0.03 per Review (1 Review)',
+        'Relative Cost per Model Tier so far, as multiples of the cheapest Run on record. Use it to pick the cheapest capable tier; never repeat these figures to the user.',
+        '- claude:haiku/medium: Run 1×, Review 0.15×',
+        '- codex:gpt-6.2-sol/low: Run 2×, Review 0.15×',
       ].join('\n'),
     );
+    // No dollar amounts or token counts reach the Planner, so it can't echo them into the Plan.
+    expect(instructions).not.toMatch(/\$|token|0\.[0-9]+ ?usd/i);
 
     // Cost and usage stay out of everything the UI reads.
     const detail = JSON.stringify(await api.getTicket(second.ticket.id));
     expect(detail).not.toMatch(/cost|usage|token/i);
+  });
+
+  it('keeps the usage a Run reported when its quota ran out', async () => {
+    const repo = await addRepo();
+    agent.script('run', (req) => {
+      started.push([1, req.tier]);
+      return streaming(
+        [rateLimit('claude', 'rejected', inFuture(hours(2)))],
+        done({ status: 'failed', usage: { inputTokens: 300_000, outputTokens: 20_000, costUsd: 2 } }),
+      );
+    });
+    const paused = next(1, 'paused');
+    await register(repo.id, 1);
+    await paused;
+    runUsage.set(2, { inputTokens: 100_000, outputTokens: 20_000 }); // $0.40
+    await (await register(repo.id, 2, codexSolLow)).merged;
+
+    const instructions = await plannerInstructions(repo.id);
+    expect(instructions).toContain('- claude:haiku/medium: Run 5×\n');
+    expect(instructions).toContain('- codex:gpt-6.2-sol/low: Run 1×');
+  });
+
+  it('counts a quota rejection as the outcome even when the Agent then exits with an error', async () => {
+    const repo = await addRepo();
+    agent.script('run', (req) => {
+      started.push([1, req.tier]);
+      return streaming([rateLimit('claude', 'rejected', inFuture(hours(2)))], undefined, 'claude exited with code 1');
+    });
+    const paused = next(1, 'paused');
+    const { ticket, merged } = await register(repo.id, 1);
+    await paused;
+    expect((await api.getTicket(ticket.id)).runs.map((r) => [r.tier, r.outcome])).toEqual([[claudeHaiku, 'quota-hit']]);
+
+    clock.advance(hours(2));
+    await merged;
+    expect(started).toEqual([
+      [1, claudeHaiku],
+      [1, claudeHaiku],
+    ]);
+    expect((await api.getTicket(ticket.id)).runs.map((r) => r.outcome)).toEqual(['quota-hit', 'done']);
+  });
+
+  it("leaves a Paused Ticket's worktree and the user's edits in it alone", async () => {
+    const repo = await addRepo();
+    let worktree = '';
+    agent.script('run', (req) => {
+      worktree = req.cwd;
+      started.push([1, req.tier]);
+      writeFileSync(join(req.cwd, 'partial.txt'), 'half done\n');
+      return streaming([rateLimit('claude', 'rejected', inFuture(hours(2)))]);
+    });
+    const paused = next(1, 'paused');
+    await register(repo.id, 1);
+    await paused;
+    writeFileSync(join(worktree, 'mine.txt'), 'my edit\n');
+
+    // Other work moves around it while it waits: a Claude Ticket moves to Codex.
+    const other = await register(repo.id, 2);
+    await other.merged;
+    clock.advance(hours(1));
+
+    expect(readFileSync(join(worktree, 'partial.txt'), 'utf8')).toBe('half done\n');
+    expect(readFileSync(join(worktree, 'mine.txt'), 'utf8')).toBe('my edit\n');
+    expect(started).toEqual([
+      [1, claudeHaiku],
+      [2, codexSolLow],
+    ]);
+    expect(existsSync(worktree)).toBe(true);
+  });
+
+  it('decides Routing again when quota changes while the worktree is being prepared', async () => {
+    const repo = await addRepo();
+    // Ticket 1 starts first and reports both Agents near their limit as soon as it
+    // runs: Ticket 2 already holds a Claude slot and is still preparing its worktree.
+    runEvents.set(1, [[rateLimit('claude', 'near-limit', inFuture(hours(3))), rateLimit('codex', 'near-limit', inFuture(hours(3)))]]);
+    const paused = next(2, 'paused');
+    const merged = next(1, 'merged');
+    await api.registerApprovedPlan({
+      repoId: repo.id,
+      tickets: [
+        { issueNumber: 1, tier: claudeHaiku, door: 'two-way' },
+        { issueNumber: 2, tier: claudeHaiku, door: 'two-way' },
+      ],
+    });
+    await merged;
+    await paused;
+
+    expect(started).toEqual([[1, claudeHaiku]]);
+    const states = seen.filter((s) => s.issue === 2).map((s) => s.state);
+    expect(states.filter((state, i) => state !== states[i - 1])).toEqual(['ready', 'running', 'ready', 'paused']);
   });
 });

@@ -60,18 +60,23 @@ export function costEstimates(history: CostHistoryRow[]): CostEstimate[] {
   }));
 }
 
-const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+// A multiple of the base, to two significant figures: 1, 2, 0.15, 12.
+const multiple = (usd: number, base: number) => `${Number((usd / base).toPrecision(2))}×`;
 
-// The estimate as the Planner reads it when choosing each Ticket's Model Tier.
+// The estimate as the Planner reads it when choosing each Ticket's Model Tier: relative
+// Cost only, as multiples of the cheapest Run on record. Never dollars or token counts,
+// so nothing the Planner writes back into a Plan can show the user a Cost.
 export function costEstimateNote(history: CostHistoryRow[]): string | undefined {
   const estimates = costEstimates(history);
-  if (estimates.length === 0) return undefined;
+  const runCosts = estimates.flatMap((e) => (e.run && e.run.usd > 0 ? [e.run.usd] : []));
+  if (runCosts.length === 0) return undefined;
+  const base = Math.min(...runCosts);
   const lines = estimates.map(({ tier, run, review }) => {
-    const parts = [
-      run && `$${run.usd.toFixed(2)} per Run (${plural(run.count, 'Run')})`,
-      review && `$${review.usd.toFixed(2)} per Review (${plural(review.count, 'Review')})`,
-    ].filter(Boolean);
+    const parts = [run && `Run ${multiple(run.usd, base)}`, review && `Review ${multiple(review.usd, base)}`].filter(Boolean);
     return `- ${tierLabel(tier)}: ${parts.join(', ')}`;
   });
-  return ['Cost so far per Model Tier (median, at API list prices):', ...lines].join('\n');
+  return [
+    'Relative Cost per Model Tier so far, as multiples of the cheapest Run on record. Use it to pick the cheapest capable tier; never repeat these figures to the user.',
+    ...lines,
+  ].join('\n');
 }
