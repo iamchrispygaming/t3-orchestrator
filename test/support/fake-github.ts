@@ -127,6 +127,10 @@ export class FakeGitHub implements GitHub {
     return this.repo(owner, name).pulls.map((pr) => ({ ...pr }));
   }
 
+  renamePullRequest(owner: string, name: string, number: number, title: string): void {
+    this.pull(owner, name, number).title = title;
+  }
+
   branches(owner: string, name: string): string[] {
     const out = git(this.repo(owner, name).info.cloneUrl, 'for-each-ref', '--format=%(refname:short)', 'refs/heads');
     return out === '' ? [] : out.split('\n');
@@ -193,6 +197,11 @@ export class FakeGitHub implements GitHub {
     });
   }
 
+  async getPullRequestTitle(owner: string, name: string, number: number): Promise<string> {
+    this.maybeFail('getPullRequestTitle');
+    return this.pull(owner, name, number).title;
+  }
+
   async createPullRequest(owner: string, name: string, pr: NewPullRequest): Promise<{ number: number }> {
     this.maybeFail('createPullRequest');
     const repo = this.repo(owner, name);
@@ -244,8 +253,14 @@ export class FakeGitHub implements GitHub {
   }
 
   private openPull(owner: string, name: string, number: number): FakePullRequest {
+    const pr = this.pull(owner, name, number);
+    if (pr.state !== 'open') throw new Error(`PR #${number} is not open`);
+    return pr;
+  }
+
+  private pull(owner: string, name: string, number: number): FakePullRequest {
     const pr = this.repo(owner, name).pulls.find((p) => p.number === number);
-    if (!pr || pr.state !== 'open') throw new Error(`PR #${number} is not open`);
+    if (!pr) throw new Error(`no PR #${number} on ${owner}/${name}`);
     return pr;
   }
 

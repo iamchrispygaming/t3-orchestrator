@@ -12,6 +12,7 @@ import {
   ticketSchema,
   type AddTargetRepoRequest,
   type EditPlanDraftRequest,
+  type ListTicketsQuery,
   type RegisterApprovedPlanRequest,
   type RegisterTicketRequest,
   type ReplyToPlanRequest,
@@ -63,6 +64,14 @@ export function createApiClient(fetchFn: FetchFn) {
     },
     async getTicket(id: number) {
       return ticketDetailSchema.parse(await call(`/api/tickets/${id}`));
+    },
+    async listTickets(query: ListTicketsQuery, signal?: AbortSignal) {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined) params.set(key, String(value));
+      }
+      const path = params.size ? `/api/tickets?${params}` : '/api/tickets';
+      return z.array(ticketSchema).parse(await call(path, { signal }));
     },
     async getSettings() {
       return settingsSchema.parse(await call('/api/settings'));

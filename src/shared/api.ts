@@ -18,6 +18,14 @@ export type Agent = z.infer<typeof agentSchema>;
 export const ticketStateSchema = z.enum(['waiting', 'ready', 'running', 'reviewing', 'merged', 'handback']);
 export type TicketState = z.infer<typeof ticketStateSchema>;
 
+export const listTicketsQuerySchema = z.object({
+  state: ticketStateSchema.optional(),
+  agent: agentSchema.optional(),
+  repoId: z.coerce.number<number | string>().int().positive().optional(),
+  q: z.string().trim().optional(),
+});
+export type ListTicketsQuery = z.infer<typeof listTicketsQuerySchema>;
+
 // A GitHub `owner/repo`. Anything GitHub itself would not allow (`..`, slashes) is
 // refused. Owners may hold `_`: Enterprise Managed User names end in `_<shortcode>`.
 export const addTargetRepoRequestSchema = z.object({

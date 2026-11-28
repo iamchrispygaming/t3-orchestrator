@@ -8,6 +8,7 @@ import type { z } from 'zod';
 import {
   addTargetRepoRequestSchema,
   editPlanDraftRequestSchema,
+  listTicketsQuerySchema,
   registerApprovedPlanRequestSchema,
   registerTicketRequestSchema,
   replyToPlanRequestSchema,
@@ -105,6 +106,12 @@ export function createServer(deps: ServerDeps): Server {
   app.delete('/api/repos/:id', async (c) => {
     await engine.removeTargetRepo(Number(c.req.param('id')));
     return c.json({});
+  });
+
+  app.get('/api/tickets', async (c) => {
+    const query = listTicketsQuerySchema.safeParse(c.req.query());
+    if (!query.success) return c.json({ error: query.error.message }, 400);
+    return c.json(await engine.listTickets(query.data));
   });
 
   app.post('/api/tickets', async (c) => {
