@@ -93,7 +93,12 @@ export class Planner {
     const repo = store.getTargetRepo(req.repoId);
     if (!repo) throw new PlanNotFound(`no Target Repo ${req.repoId}`);
     const plan = store.addPlan(repo.id, clock.now());
-    await this.workspace(repo).preparePlannerCheckout(plan.id, repo.defaultBranch);
+    try {
+      await this.workspace(repo).preparePlannerCheckout(plan.id, repo.defaultBranch);
+    } catch (error) {
+      store.deletePlan(plan.id);
+      throw error;
+    }
     store.addPlanMessage(plan.id, { from: 'user', text: req.idea, justDraft: false, at: clock.now().toISOString() });
     this.emit(plan.id);
     this.track(this.turn(plan.id));

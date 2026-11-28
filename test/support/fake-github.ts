@@ -38,6 +38,10 @@ export class FakeGitHub implements GitHub {
     return this.repo(owner, name).issues.get(number);
   }
 
+  issueCount(owner: string, name: string): number {
+    return this.repo(owner, name).issues.size;
+  }
+
   pulls(owner: string, name: string): FakePullRequest[] {
     return this.repo(owner, name).pulls.map((pr) => ({ ...pr }));
   }

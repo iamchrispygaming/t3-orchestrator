@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -183,5 +183,134 @@ describe('the Planner interview', () => {
 
     expect(after.status).toBe('failed');
     expect(after.messages.filter((m) => m.from === 'planner' && m.round)).toHaveLength(1);
+  });
+
+  it('keeps drafts and their chat across a restart', async () => {
+    agent
+      .script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }], { sessionId: 'planner-1', draft }))
+      .script('plan', () => drafted(draft, { sessionId: 'planner-1' }));
+    let api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    let events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    const before = await settled(events, plan.id);
+    await events.close();
+    for (const server of servers.splice(0)) await server.close();
+
+    api = start();
+    expect(await api.listPlans()).toEqual([before]);
+    events = await api.events();
+    const snapshot = await events.next();
+    expect(snapshot.type === 'snapshot' && snapshot.plans).toEqual([before]);
+
+    await api.replyToPlan(plan.id, { text: 'Yes.' });
+    const after = await settled(events, plan.id);
+    await events.close();
+    expect(after.status).toBe('drafted');
+    expect(agent.calls[1]!.resumeSessionId).toBe('planner-1');
+  });
+
+  it('redoes a Planner turn that a server stop cut short', async () => {
+    agent.script('plan', (req) => new Promise((_, reject) => req.signal.addEventListener('abort', () => reject(new Error('stopped')))));
+    let api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    while (agent.calls.length === 0) await new Promise((r) => setTimeout(r, 5));
+    for (const server of servers.splice(0)) await server.close();
+
+    agent.script('plan', () => round([{ question: 'Plain text?', recommended: 'Yes.' }]));
+    api = start();
+    const events = await api.events();
+    const snapshot = await events.next();
+    const pending = snapshot.type === 'snapshot' ? snapshot.plans.find((p) => p.id === plan.id) : undefined;
+    const asked = pending?.status === 'asking' ? pending : await settled(events, plan.id);
+    await events.close();
+
+    expect(asked.status).toBe('asking');
+    expect(asked.messages.map((m) => m.from)).toEqual(['user', 'planner']);
+    expect(agent.calls).toHaveLength(2);
+    expect(agent.calls[1]!.instructions).toContain('Greet people.');
+  });
+
+  it('holds several Plans across Target Repos at once, and discarding one leaves the others and touches nothing on GitHub', async () => {
+    mkdirSync(join(root, 'second'));
+    github.addRepo('acme', 'gadgets', createBareRemote(join(root, 'second')));
+    agent
+      .script('plan', () => drafted(draft))
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]))
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]));
+    const api = start();
+    const widgets = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const gadgets = await api.addTargetRepo({ owner: 'acme', name: 'gadgets' });
+    const events = await api.events();
+    const first = await api.startPlan({ repoId: widgets.id, idea: 'Greet people.' });
+    await settled(events, first.id);
+    const second = await api.startPlan({ repoId: widgets.id, idea: 'Wave at people.' });
+    await settled(events, second.id);
+    const third = await api.startPlan({ repoId: gadgets.id, idea: 'Build a gadget.' });
+    await settled(events, third.id);
+    const checkout = agent.calls[0]!.cwd;
+    expect(existsSync(checkout)).toBe(true);
+
+    await api.discardPlan(first.id);
+    let discarded: number | undefined;
+    while (discarded === undefined) {
+      const event = await events.next();
+      if (event.type === 'plan-discarded') discarded = event.planId;
+    }
+    await events.close();
+
+    expect(discarded).toBe(first.id);
+    expect((await api.listPlans()).map((p) => [p.id, p.repoId])).toEqual([
+      [second.id, widgets.id],
+      [third.id, gadgets.id],
+    ]);
+    await expect(api.getPlan(first.id)).rejects.toThrow(/404/);
+    expect(existsSync(checkout)).toBe(false);
+    expect(github.issueCount('acme', 'widgets')).toBe(0);
+    expect(github.pulls('acme', 'widgets')).toEqual([]);
+    expect(github.branches('acme', 'widgets')).toEqual(['main']);
+  });
+
+  it('runs every Planner turn at the Planner tier setting, never a cheaper Ladder tier', async () => {
+    const sonnet = { agent: 'claude', model: 'sonnet', effort: 'high' } as const;
+    agent
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]))
+      .script('plan', () => drafted(draft));
+    const api = start();
+    expect(await api.getSettings()).toEqual({ plannerTier: opusHigh });
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    await settled(events, plan.id);
+
+    await api.updateSettings({ plannerTier: sonnet });
+    await api.replyToPlan(plan.id, { text: 'A.' });
+    await settled(events, plan.id);
+    await events.close();
+
+    expect(agent.calls.map((c) => c.tier)).toEqual([opusHigh, sonnet]);
+    for (const server of servers.splice(0)) await server.close();
+    expect(await start().getSettings()).toEqual({ plannerTier: sonnet });
+  });
+
+  it('marks a turn failed when the Planner crashes, and a reply retries it', async () => {
+    agent
+      .script('plan', () => {
+        throw new Error('planner crashed');
+      })
+      .script('plan', () => round([{ question: 'Q?', recommended: 'A.' }]));
+    const api = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const plan = await api.startPlan({ repoId: repo.id, idea: 'Greet people.' });
+    const failed = await settled(events, plan.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.messages.at(-1)).toMatchObject({ from: 'planner', text: expect.stringContaining('planner crashed') });
+
+    await api.replyToPlan(plan.id, { text: 'Try again.' });
+    const asked = await settled(events, plan.id);
+    await events.close();
+    expect(asked.status).toBe('asking');
   });
 });
