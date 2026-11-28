@@ -77,6 +77,7 @@ export function createServer(deps: ServerDeps): Server {
     log: deps.log ?? ((message, error) => console.error(message, error)),
   });
   planner.resume();
+  engine.start();
   const openStreams = new Set<() => void>();
 
   const app = new Hono();
@@ -123,6 +124,8 @@ export function createServer(deps: ServerDeps): Server {
     if (!req.success) return c.json({ error: req.error.message }, 400);
     return c.json(engine.updateParallelLimits(req.data));
   });
+
+  app.post('/api/tickets/:id/resume', (c) => c.json(engine.resumeTicket(Number(c.req.param('id')))));
 
   app.get('/api/tickets/:id', (c) => {
     const id = Number(c.req.param('id'));
