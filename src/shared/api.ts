@@ -59,6 +59,7 @@ export type RegisterApprovedPlanRequest = z.infer<typeof registerApprovedPlanReq
 export const ticketSchema = z.object({
   id: z.number().int(),
   repoId: z.number().int(),
+  repo: z.string(), // the Target Repo's `owner/name`
   issueNumber: z.number().int(),
   title: z.string(),
   branch: z.string(),
@@ -91,6 +92,7 @@ export const runRecordSchema = z.object({
   startedAt: z.iso.datetime(),
   endedAt: z.iso.datetime().nullable(),
   outcome: z.enum(['done', 'failed', 'cannot', 'needs-permission']).nullable(),
+  reason: z.string().nullable(), // why it failed; null while running or when it succeeded
 });
 export type RunRecord = z.infer<typeof runRecordSchema>;
 
@@ -99,12 +101,15 @@ export const reviewRecordSchema = z.object({
   startedAt: z.iso.datetime(),
   endedAt: z.iso.datetime().nullable(),
   verdict: z.enum(['approve', 'changes-needed', 'unclear']).nullable(),
+  findings: z.string().nullable(), // null while the Review runs
 });
 export type ReviewRecord = z.infer<typeof reviewRecordSchema>;
 
 export const ticketDetailSchema = ticketSchema.extend({
   runs: z.array(runRecordSchema),
   reviews: z.array(reviewRecordSchema),
+  // Live Agent output of its Runs and Reviews since the server started, oldest first.
+  output: z.array(z.string()),
 });
 export type TicketDetail = z.infer<typeof ticketDetailSchema>;
 
@@ -181,6 +186,8 @@ export const serverEventSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('ticket'), ticket: ticketSchema }),
   z.object({ type: z.literal('plan'), plan: planSchema }),
   z.object({ type: z.literal('plan-discarded'), planId: z.number().int() }),
+  // One line of a Run's or Review's live Agent output.
+  z.object({ type: z.literal('output'), ticketId: z.number().int(), text: z.string() }),
 ]);
 export type ServerEvent = z.infer<typeof serverEventSchema>;
 

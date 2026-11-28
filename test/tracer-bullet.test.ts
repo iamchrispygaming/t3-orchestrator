@@ -68,7 +68,10 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     const states: TicketState[] = [];
     while (states.at(-1) !== 'merged') {
       const event = await events.next();
-      if (event.type === 'ticket' && event.ticket.id === ticket.id) states.push(event.ticket.state);
+      // Ticket events also follow Run, Review and PR changes; keep state changes only.
+      if (event.type === 'ticket' && event.ticket.id === ticket.id && event.ticket.state !== states.at(-1)) {
+        states.push(event.ticket.state);
+      }
     }
     await events.close();
     return { api, ticket, states, seenByAgent };
@@ -117,10 +120,10 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
 
     expect(detail.state).toBe('merged');
     expect(detail.runs).toEqual([
-      { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done' },
+      { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done', reason: null },
     ]);
     expect(detail.reviews).toEqual([
-      { tier, startedAt: '2026-01-01T09:05:00.000Z', endedAt: '2026-01-01T09:07:00.000Z', verdict: 'approve' },
+      { tier, startedAt: '2026-01-01T09:05:00.000Z', endedAt: '2026-01-01T09:07:00.000Z', verdict: 'approve', findings: 'Looks good.' },
     ]);
   });
 

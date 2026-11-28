@@ -1,0 +1,38 @@
+/* Styling is provisional: a visual design pass comes later. */
+@import 'tailwindcss';
+
+@theme {
+  --color-bg: #141416;
+  --color-panel: #1a1a1d;
+  --color-card: #202024;
+  --color-line: #2c2c31;
+  --color-line2: #38383e;
+  --color-mute: #8b8b94;
+  --color-dim: #5f5f68;
+  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, ui-monospace, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--color-bg);
+  color: #e7e7ea;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.blink {
+  animation: blink 1.4s infinite;
+}
