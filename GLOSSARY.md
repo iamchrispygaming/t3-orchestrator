@@ -38,7 +38,7 @@ A Ticket whose change is hard to walk back once merged, such as a destructive mi
 _Avoid_: risky Ticket
 
 **Two-way Ticket**
-A Ticket whose change is cheap to walk back. Once its Agent reports it done and its checks pass, its pull request merges without the user, unless the Target Repo has no checks, needs a human approval to merge, or has auto-merge turned off.
+A Ticket whose change is cheap to walk back. Once its Agent reports it done, its checks pass and its Review approves, its pull request merges without the user, unless the Target Repo has no checks, needs a human approval to merge, or has auto-merge turned off.
 
 **Routing**
 Choosing the Model Tier that first works a Ticket. The Planner names it for each Ticket from the Ladder, picking the cheapest it judges capable. When that Agent is near its quota limit, the Orchestrator moves the Ticket to the next more capable Model Tier of another Agent, and pauses if every Agent is near its limit.
@@ -52,6 +52,10 @@ A point where the Orchestrator stops for the user: approving the plan, and mergi
 **Run**
 One unattended Agent run on one Ticket at one Model Tier. A Ticket has one or more Runs: Escalation, Refresh, and redoing a Run cut short when the Orchestrator itself stopped each start a new one from a freshly reset worktree (the last at the same Model Tier, not counted as a failure), while a Run asked for at the merge Checkpoint continues the existing work with the user's feedback.
 _Avoid_: attempt, job
+
+**Review**
+One unattended read of a Ticket's pull request by the other Agent, at a Model Tier above the one that wrote it, ending in approve or changes needed. A Two-way Ticket cannot merge without an approving Review; for a One-way Ticket the Review only advises the user at the merge Checkpoint. A Review never commits and is not a Run: it uses up no Model Tier.
+_Avoid_: code review (the user's own review at the merge Checkpoint)
 
 **Refresh**
 A new Run of a Ticket at the same Model Tier, started because the default branch moved under its open pull request and a plain rebase conflicts. It is not an Escalation: the Ticket did not fail, so no Model Tier is used up.
