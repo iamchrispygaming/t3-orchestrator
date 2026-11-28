@@ -214,7 +214,7 @@ describe('Target Repos', () => {
       expect(await api.listTargetRepos()).toEqual([{ id: 1, owner: 'acme', name: 'widgets', defaultBranch: 'main' }]);
       // Its Tickets and their Runs came through the migration.
       expect((await api.getTicket(1)).runs).toEqual([
-        { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done' },
+        { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done', reason: null },
       ]);
       await expect(api.addTargetRepo({ owner: 'ACME', name: 'widgets' })).rejects.toThrow(/409.*already/);
     });
