@@ -117,10 +117,10 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
 
     expect(detail.state).toBe('merged');
     expect(detail.runs).toEqual([
-      { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done' },
+      { tier, startedAt: '2026-01-01T09:00:00.000Z', endedAt: '2026-01-01T09:05:00.000Z', outcome: 'done', reason: null },
     ]);
     expect(detail.reviews).toEqual([
-      { tier, startedAt: '2026-01-01T09:05:00.000Z', endedAt: '2026-01-01T09:07:00.000Z', verdict: 'approve' },
+      { tier, startedAt: '2026-01-01T09:05:00.000Z', endedAt: '2026-01-01T09:07:00.000Z', verdict: 'approve', findings: 'Looks good.' },
     ]);
   });
 

@@ -25,6 +25,7 @@ import type { GitHub } from './github.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
 import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
 import { Store } from './store.ts';
+import { readWebFile } from './web-files.ts';
 
 export type ServerDeps = {
   env: Record<string, string | undefined>;
@@ -33,6 +34,7 @@ export type ServerDeps = {
   clock?: Clock;
   notifier?: Notifier;
   log?: (message: string, error?: unknown) => void;
+  webRoot?: string; // the built web UI, served at /; none in API-only tests
 };
 
 export type Server = {
@@ -126,7 +128,11 @@ export function createServer(deps: ServerDeps): Server {
     const id = Number(c.req.param('id'));
     const ticket = engine.ticket(id); // a removed Target Repo's Tickets stay readable as history
     if (!ticket) return c.json({ error: `no Ticket ${id}` }, 404);
-    const detail: TicketDetail = { ...ticket, runs: store.listRuns(id), reviews: store.listReviews(id) };
+    const detail: TicketDetail = {
+      ...ticket,
+      runs: store.listRuns(id), reviews: store.listReviews(id),
+      output: engine.output(id),
+    };
     return c.json(detail);
   });
 
@@ -167,6 +173,7 @@ export function createServer(deps: ServerDeps): Server {
         queue = queue.then(() => stream.writeSSE({ event: event.type, data: JSON.stringify(event) }));
       };
       const unsubscribeTickets = engine.subscribe((ticket) => send({ type: 'ticket', ticket }));
+      const unsubscribeOutput = engine.subscribeOutput((ticketId, text) => send({ type: 'output', ticketId, text }));
       const unsubscribePlans = planner.subscribe(send);
       send({ type: 'snapshot', tickets: engine.tickets(), plans: planner.plans() });
       await new Promise<void>((resolve) => {
@@ -174,10 +181,22 @@ export function createServer(deps: ServerDeps): Server {
         stream.onAbort(resolve);
       });
       unsubscribeTickets();
+      unsubscribeOutput();
       unsubscribePlans();
       await queue.catch(() => undefined);
     }),
   );
+
+  app.all('/api/*', (c) => c.json({ error: `no route ${c.req.method} ${c.req.path}` }, 404));
+
+  const webRoot = deps.webRoot;
+  if (webRoot) {
+    app.get('*', async (c) => {
+      const file = await readWebFile(webRoot, c.req.path);
+      if (!file) return c.text('Not found', 404);
+      return c.body(new Uint8Array(file.body), 200, { 'content-type': file.type });
+    });
+  }
 
   return {
     app,

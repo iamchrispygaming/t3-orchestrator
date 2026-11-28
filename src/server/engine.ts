@@ -34,6 +34,8 @@ import type { Store, StoredTicket } from './store.ts';
 import { RepoWorkspace, type TicketFolders } from './workspace.ts';
 
 export const RUN_TIME_LIMIT_MS = 60 * 60_000;
+// Live output kept in memory per Ticket; older lines drop off.
+export const OUTPUT_LINES_KEPT = 2000;
 
 export class NotYetHandled extends Error {}
 
@@ -78,6 +80,8 @@ function publicTicket({ body: _body, ...ticket }: StoredTicket): Ticket {
 
 export class Engine {
   private listeners = new Set<(ticket: Ticket) => void>();
+  private outputListeners = new Set<(ticketId: number, text: string) => void>();
+  private outputs = new Map<number, string[]>();
   private inFlight = new Set<Promise<void>>();
   private stopping = new AbortController();
   // Agent executions in progress: a slot is held from the Run's start until the
@@ -93,6 +97,16 @@ export class Engine {
   subscribe(listener: (ticket: Ticket) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  // Live Agent output of every Run and Review, line by line.
+  subscribeOutput(listener: (ticketId: number, text: string) => void): () => void {
+    this.outputListeners.add(listener);
+    return () => this.outputListeners.delete(listener);
+  }
+
+  output(ticketId: number): string[] {
+    return [...(this.outputs.get(ticketId) ?? [])];
   }
 
   tickets(): Ticket[] {
@@ -294,6 +308,14 @@ export class Engine {
     this.schedule();
   }
 
+  private emitOutput(id: number, text: string): void {
+    const lines = this.outputs.get(id) ?? [];
+    lines.push(text);
+    if (lines.length > OUTPUT_LINES_KEPT) lines.splice(0, lines.length - OUTPUT_LINES_KEPT);
+    this.outputs.set(id, lines);
+    for (const listener of this.outputListeners) listener(id, text);
+  }
+
   private async work(id: number): Promise<void> {
     const { store, github, clock } = this.deps;
     const ticket = store.getTicket(id)!;
@@ -365,6 +387,7 @@ export class Engine {
       signal: AbortSignal.any([this.stopping.signal, AbortSignal.timeout(RUN_TIME_LIMIT_MS)]),
     });
     for await (const event of events) {
+      if (event.type === 'text') this.emitOutput(ticket.id, event.text);
       if (event.type === 'result') return schema.parse(event.result);
     }
     throw new NotYetHandled(`${mode} ended without a result`);

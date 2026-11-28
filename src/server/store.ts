@@ -119,13 +119,16 @@ export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
 
 export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
 
-export type NewTicket = Omit<StoredTicket, 'id' | 'prNumber'> & {
+export type NewTicket = Omit<StoredTicket, 'id' | 'repo' | 'prNumber'> & {
   planId: number;
   planPosition: number;
   blockers: Blocker[];
 };
 
 type Row = Record<string, unknown>;
+
+const SELECT_TICKETS = `SELECT t.*, r.owner || '/' || r.name AS repo
+  FROM tickets t JOIN target_repos r ON r.id = t.repo_id`;
 
 export type StoredTicket = Ticket & { body: string };
 
@@ -298,15 +301,14 @@ export class Store {
   }
 
   waitingTickets(): StoredTicket[] {
-    return (this.db.prepare("SELECT * FROM tickets WHERE state = 'waiting' ORDER BY id").all() as Row[]).map(toTicket);
+    return (this.db.prepare(`${SELECT_TICKETS} WHERE t.state = 'waiting' ORDER BY t.id`).all() as Row[]).map(toTicket);
   }
 
   // Ready Tickets in queue order: oldest-approved Plan first, then Plan order.
   readyQueue(): StoredTicket[] {
     const rows = this.db
       .prepare(
-        `SELECT t.* FROM tickets t LEFT JOIN approved_plans p ON p.id = t.plan_id
-         JOIN target_repos r ON r.id = t.repo_id
+        `${SELECT_TICKETS} LEFT JOIN approved_plans p ON p.id = t.plan_id
          WHERE t.state = 'ready' AND r.removing_since IS NULL AND r.removed_at IS NULL -- no work on a repo being removed
          ORDER BY p.approved_at, p.id, t.plan_position, t.id`,
       )
@@ -324,23 +326,17 @@ export class Store {
   }
 
   getTicket(id: number): StoredTicket | undefined {
-    const row = this.db.prepare('SELECT * FROM tickets WHERE id = ?').get(id) as Row | undefined;
+    const row = this.db.prepare(`${SELECT_TICKETS} WHERE t.id = ?`).get(id) as Row | undefined;
     return row && toTicket(row);
   }
 
   // Tickets on Target Repos the user has not removed.
   listTickets(): StoredTicket[] {
-    const rows = this.db
-      .prepare(
-        `SELECT tickets.* FROM tickets JOIN target_repos ON target_repos.id = tickets.repo_id
-         WHERE target_repos.removed_at IS NULL ORDER BY tickets.id`,
-      )
-      .all() as Row[];
-    return rows.map(toTicket);
+    return (this.db.prepare(`${SELECT_TICKETS} WHERE r.removed_at IS NULL ORDER BY t.id`).all() as Row[]).map(toTicket);
   }
 
   listTicketsOfRepo(repoId: number): StoredTicket[] {
-    return (this.db.prepare('SELECT * FROM tickets WHERE repo_id = ? ORDER BY id').all(repoId) as Row[]).map(toTicket);
+    return (this.db.prepare(`${SELECT_TICKETS} WHERE t.repo_id = ? ORDER BY t.id`).all(repoId) as Row[]).map(toTicket);
   }
 
   updateTicket(id: number, change: { state?: TicketState; prNumber?: number }): void {
@@ -368,6 +364,7 @@ export class Store {
       startedAt: String(r.started_at),
       endedAt: r.ended_at == null ? null : String(r.ended_at),
       outcome: (r.outcome ?? null) as RunRecord['outcome'],
+      reason: r.outcome == null || r.outcome === 'done' || !r.reason ? null : String(r.reason),
     }));
   }
 
@@ -391,6 +388,7 @@ export class Store {
       startedAt: String(r.started_at),
       endedAt: r.ended_at == null ? null : String(r.ended_at),
       verdict: (r.verdict ?? null) as ReviewRecord['verdict'],
+      findings: r.findings == null ? null : String(r.findings),
     }));
   }
 
@@ -490,6 +488,7 @@ function toTicket(row: Row): StoredTicket {
   return {
     id: Number(row.id),
     repoId: Number(row.repo_id),
+    repo: String(row.repo),
     issueNumber: Number(row.issue_number),
     title: String(row.title),
     body: String(row.body),
