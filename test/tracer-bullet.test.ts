@@ -68,7 +68,10 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     const states: TicketState[] = [];
     while (states.at(-1) !== 'merged') {
       const event = await events.next();
-      if (event.type === 'ticket' && event.ticket.id === ticket.id) states.push(event.ticket.state);
+      // Ticket events also follow Run, Review and PR changes; keep state changes only.
+      if (event.type === 'ticket' && event.ticket.id === ticket.id && event.ticket.state !== states.at(-1)) {
+        states.push(event.ticket.state);
+      }
     }
     await events.close();
     return { api, ticket, states, seenByAgent };

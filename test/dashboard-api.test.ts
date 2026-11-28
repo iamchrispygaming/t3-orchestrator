@@ -3,9 +3,9 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createServer, type Server } from '../src/server/server.ts';
-import type { ModelTier, ServerEvent } from '../src/shared/api.ts';
+import type { ModelTier, ServerEvent, TicketDetail } from '../src/shared/api.ts';
 import { createApiClient, type EventStream } from '../src/web/api.ts';
 import { approve, done, FakeAgentRunner } from './support/fake-agent-runner.ts';
 import { FakeClock } from './support/fake-clock.ts';
@@ -88,6 +88,60 @@ describe('the dashboard API', () => {
       tickets: [expect.objectContaining({ repo: 'acme/widgets', prNumber: github.pulls('acme', 'widgets')[0]?.number })],
     });
   });
+
+  // What a drawer does: on each Ticket event for its Ticket, refetch the detail.
+  async function untilDetailShows(
+    api: ReturnType<typeof start>['api'],
+    events: EventStream,
+    ticketId: number,
+    shows: (detail: TicketDetail) => boolean,
+  ): Promise<TicketDetail> {
+    for (;;) {
+      await nextMatching(
+        events,
+        (e): e is Extract<ServerEvent, { type: 'ticket' }> => e.type === 'ticket' && e.ticket.id === ticketId,
+      );
+      const detail = await api.getTicket(ticketId);
+      if (shows(detail)) return detail;
+    }
+  }
+
+  it('announces each Run and Review starting and ending, and the PR opening, with a Ticket event', async () => {
+    const runGo = Promise.withResolvers<void>();
+    const reviewGo = Promise.withResolvers<void>();
+    onTestFinished(() => {
+      runGo.resolve();
+      reviewGo.resolve();
+      github.releaseChecks();
+    });
+    agent.script('run', async (req) => {
+      await runGo.promise;
+      commitFile(req.cwd, 'hello.txt', 'hello\n', 'Add hello.txt');
+      return done();
+    });
+    agent.script('review', async () => {
+      await reviewGo.promise;
+      return approve({ verdict: 'changes-needed', findings: 'Missing a test.' });
+    });
+    github.holdChecks();
+    const { api } = start();
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    const events = await api.events();
+    const { id } = await api.registerTicket({ repoId: repo.id, issueNumber: 7, tier, door: 'two-way' });
+
+    await untilDetailShows(api, events, id, (d) => d.runs.length === 1 && d.runs[0]!.endedAt === null);
+    runGo.resolve();
+    await untilDetailShows(api, events, id, (d) => d.runs[0]!.outcome === 'done');
+    const opened = await untilDetailShows(api, events, id, (d) => d.prNumber !== null);
+    github.releaseChecks();
+    await untilDetailShows(api, events, id, (d) => d.reviews.length === 1 && d.reviews[0]!.verdict === null);
+    reviewGo.resolve();
+    const reviewed = await untilDetailShows(api, events, id, (d) => d.reviews[0]!.verdict === 'changes-needed');
+    await events.close();
+
+    expect(opened.prNumber).toBe(github.pulls('acme', 'widgets')[0]?.number);
+    expect(reviewed.reviews[0]?.findings).toBe('Missing a test.');
+  }, 10_000);
 
   async function runToMerged(api: ReturnType<typeof start>['api']) {
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });

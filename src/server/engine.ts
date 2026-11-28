@@ -263,6 +263,7 @@ export class Engine {
     this.emit(id);
   }
 
+  // Sent after every write a Ticket's drawer shows: state, PR, Run and Review records.
   private emit(id: number): void {
     const ticket = publicTicket(this.deps.store.getTicket(id)!);
     for (const listener of this.listeners) listener(ticket);
@@ -334,8 +335,10 @@ export class Engine {
     try {
       folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
       const runId = store.startRun(id, ticket.tier, clock.now());
+      this.emit(id);
       run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
       store.endRun(runId, clock.now(), run.status, run.reason);
+      this.emit(id);
     } finally {
       this.freeSlot(ticket.tier.agent);
     }
@@ -352,6 +355,7 @@ export class Engine {
       body: `${run.prBody}\n\nCloses #${ticket.issueNumber}`,
     });
     store.updateTicket(id, { prNumber: pr.number });
+    this.emit(id);
     const checks = await github.getChecks(repo.owner, repo.name, ticket.branch);
     if (checks !== 'success') throw new NotYetHandled(`CI is ${checks}`);
 
@@ -359,8 +363,10 @@ export class Engine {
     // Simplest reviewer rule for now: the Run's own Model Tier (#27 picks the other Agent).
     const reviewTier = ticket.tier;
     const reviewId = store.startReview(id, reviewTier, clock.now());
+    this.emit(id);
     const review = await this.runAgent('review', reviewTier, folders.worktree, folders.scratch, reviewOutcomeSchema, ticket);
     store.endReview(reviewId, clock.now(), review.verdict, review.findings);
+    this.emit(id);
     if (review.verdict !== 'approve') throw new NotYetHandled(`Review verdict ${review.verdict}`);
 
     if (mostCautious(ticket.door, run.door, review.door) !== 'two-way') throw new NotYetHandled('One-way Ticket');

@@ -40,10 +40,15 @@ function useTicketDetail(ticket: Ticket) {
     return stop;
   }, [ticket.id]);
 
-  // Run and Review records change with the Ticket's state.
+  // Every Ticket event replaces `ticket`: the server sends one after each state,
+  // PR, Run and Review change, so refetch the Run history and Reviews on each.
   useEffect(() => {
-    void api.getTicket(ticket.id).then((d) => setDetail(d));
-  }, [ticket.id, ticket.state, ticket.prNumber]);
+    let current = true;
+    void api.getTicket(ticket.id).then((d) => current && setDetail(d));
+    return () => {
+      current = false;
+    };
+  }, [ticket]);
 
   return { detail, output };
 }
