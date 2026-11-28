@@ -96,7 +96,9 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
   afterEach(async () => {
     await events.close();
     await pump;
-    await server.close();
+    const closing = server.close();
+    github.releaseChecks();
+    await closing;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -137,8 +139,13 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
     await reached(issue, 'merged');
   }
 
-  async function until(condition: () => boolean): Promise<void> {
-    while (!condition()) await new Promise((r) => setTimeout(r, 5));
+  // Polls with a deadline, so a scheduling regression fails here instead of hanging.
+  async function until(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+      if (Date.now() > deadline) throw new Error(`condition not met within ${timeoutMs} ms`);
+      await new Promise((r) => setTimeout(r, 5));
+    }
   }
 
   function addIssues(repo: string, specs: { number: number; blockedBy?: number[] }[]) {
@@ -166,15 +173,45 @@ describe('blockers, queue order and per-Agent parallel slots', () => {
     expect(started).toEqual([1, 2, 3]);
   });
 
-  it('does not wait on a blocker whose issue is already closed on GitHub', async () => {
+  it('keeps a Ticket Waiting on a blocker whose issue was closed on GitHub without a merge', async () => {
     addIssues('widgets', [{ number: 1 }, { number: 2, blockedBy: [1] }]);
     github.closeIssue('acme', 'widgets', 1);
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
 
     await approvePlan({ repoId: repo.id, tickets: [ticket(2)] });
 
+    expect(await stateNow(2)).toBe('waiting');
+    expect(started).toEqual([]);
+  });
+
+  it('does not wait on a blocker that is not a Ticket but was closed by a merged PR', async () => {
+    addIssues('widgets', [{ number: 1 }, { number: 2, blockedBy: [1] }]);
+    github.closeIssue('acme', 'widgets', 1, { byMergedPullRequest: true });
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+
+    await approvePlan({ repoId: repo.id, tickets: [ticket(2)] });
+
     await reached(2, 'running');
     expect(statesOf(2)).toEqual(['ready', 'running']);
+  });
+
+  it("frees the Agent's slot when its Run ends, while that Ticket still waits on CI", async () => {
+    addIssues('widgets', [{ number: 1 }, { number: 2 }]);
+    const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
+    await api.updateParallelLimits({ claude: 1 });
+    github.holdChecks();
+
+    await approvePlan({ repoId: repo.id, tickets: [ticket(1), ticket(2)] });
+    await until(() => open.has(1));
+    expect(await stateNow(2)).toBe('ready');
+
+    open.get(1)!.release();
+    await until(() => open.has(2));
+    expect(await stateNow(1)).toBe('running'); // its PR is open, CI not finished
+
+    github.releaseChecks();
+    await reached(1, 'merged');
+    await finish(2);
   });
 
   it('runs at most the parallel limit (default 2) per Agent, counted across Target Repos', async () => {

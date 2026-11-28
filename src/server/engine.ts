@@ -7,6 +7,7 @@
 // with NotYetHandled until the ticket that builds it lands (Escalation #26, Review #27, doors #28, ...).
 import { z } from 'zod';
 import type {
+  Agent,
   Door,
   ModelTier,
   ApprovedPlan,
@@ -18,12 +19,18 @@ import type {
   TicketState,
   UpdateParallelLimitsRequest,
 } from '../shared/api.ts';
-import { reviewOutcomeSchema, runOutcomeSchema, type AgentRunner, type RunMode } from './agent-runner.ts';
+import {
+  reviewOutcomeSchema,
+  runOutcomeSchema,
+  type AgentRunner,
+  type RunMode,
+  type RunOutcome,
+} from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import type { GitHub } from './github.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
-import { RepoWorkspace } from './workspace.ts';
+import { RepoWorkspace, type TicketFolders } from './workspace.ts';
 
 export const RUN_TIME_LIMIT_MS = 60 * 60_000;
 
@@ -65,6 +72,9 @@ export class Engine {
   private listeners = new Set<(ticket: Ticket) => void>();
   private inFlight = new Set<Promise<void>>();
   private stopping = new AbortController();
+  // Agent executions in progress: a slot is held from the Run's start until the
+  // Agent returns, not while the Orchestrator pushes, opens the PR and waits on CI.
+  private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
   private deps: EngineDeps;
 
   constructor(deps: EngineDeps) {
@@ -101,9 +111,10 @@ export class Engine {
       req.tickets.map(async (entry) => ({
         entry,
         issue: await github.getIssue(repo.owner, repo.name, entry.issueNumber),
-        // A blocker already closed on GitHub is done; it never holds the Ticket back.
+        // A blocker a merged PR already closed is done. Any other blocker holds the
+        // Ticket until the Orchestrator's own Ticket for it is Merged.
         blockers: (await github.getBlockers(repo.owner, repo.name, entry.issueNumber))
-          .filter((blocker) => blocker.state === 'open')
+          .filter((blocker) => !blocker.merged)
           .map((blocker) => blocker.number),
       })),
     );
@@ -174,14 +185,18 @@ export class Engine {
     if (this.stopping.signal.aborted) return;
     const { store } = this.deps;
     const limits = store.parallelLimits();
-    const running = store.runningPerAgent();
     for (const ticket of store.readyQueue()) {
       const agent = ticket.tier.agent;
-      if (running[agent] >= limits[agent]) continue;
-      running[agent]++;
+      if (this.slotsInUse[agent] >= limits[agent]) continue;
+      this.slotsInUse[agent]++;
       this.setState(ticket.id, 'running');
       this.track(this.work(ticket.id));
     }
+  }
+
+  private freeSlot(agent: Agent): void {
+    this.slotsInUse[agent]--;
+    this.schedule();
   }
 
   // A merge may unblock Waiting dependents; they join the queue straight away.
@@ -199,10 +214,16 @@ export class Engine {
     const repo = store.getTargetRepo(ticket.repoId)!;
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
 
-    const folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
-    const runId = store.startRun(id, ticket.tier, clock.now());
-    const run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
-    store.endRun(runId, clock.now(), run.status, run.reason);
+    let folders: TicketFolders;
+    let run: RunOutcome;
+    try {
+      folders = await workspace.prepareTicket(ticket.issueNumber, ticket.branch, repo.defaultBranch);
+      const runId = store.startRun(id, ticket.tier, clock.now());
+      run = await this.runAgent('run', ticket.tier, folders.worktree, folders.scratch, runOutcomeSchema, ticket);
+      store.endRun(runId, clock.now(), run.status, run.reason);
+    } finally {
+      this.freeSlot(ticket.tier.agent);
+    }
     if (run.status !== 'done') throw new NotYetHandled(`Run ended ${run.status}: ${run.reason}`);
     if ((await workspace.commitsAhead(ticket.branch, repo.defaultBranch)) === 0) {
       throw new NotYetHandled('Run made no commits');
@@ -220,7 +241,6 @@ export class Engine {
     if (checks !== 'success') throw new NotYetHandled(`CI is ${checks}`);
 
     this.setState(id, 'reviewing');
-    this.schedule(); // the Run is over, so its slot is free
     // Simplest reviewer rule for now: the Run's own Model Tier (#27 picks the other Agent).
     const reviewTier = ticket.tier;
     const reviewId = store.startReview(id, reviewTier, clock.now());

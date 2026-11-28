@@ -1,4 +1,4 @@
-import type { ChecksState, GitHub, Issue, MergeMethod, NewPullRequest, RepoInfo } from '../../src/server/github.ts';
+import type { Blocker, ChecksState, GitHub, Issue, MergeMethod, NewPullRequest, RepoInfo } from '../../src/server/github.ts';
 import { git } from './git.ts';
 
 export type FakePullRequest = NewPullRequest & {
@@ -12,6 +12,7 @@ type FakeRepo = {
   info: RepoInfo;
   issues: Map<number, Issue>;
   blockedBy: Map<number, number[]>; // native issue dependencies
+  closedByMerge: Set<number>; // issues a merged PR closed
 
   pulls: FakePullRequest[];
   checks: ChecksState;
@@ -22,12 +23,14 @@ type FakeRepo = {
 export class FakeGitHub implements GitHub {
   private repos = new Map<string, FakeRepo>();
   private nextNumber = 1000;
+  private checksHeld: PromiseWithResolvers<void> | undefined;
 
   addRepo(owner: string, name: string, remotePath: string, defaultBranch = 'main'): void {
     this.repos.set(`${owner}/${name}`, {
       info: { defaultBranch, cloneUrl: remotePath },
       issues: new Map(),
       blockedBy: new Map(),
+      closedByMerge: new Set(),
       pulls: [],
       checks: 'success',
     });
@@ -43,10 +46,23 @@ export class FakeGitHub implements GitHub {
     repo.blockedBy.set(issue.number, blockedBy);
   }
 
-  closeIssue(owner: string, name: string, number: number): void {
-    const issue = this.repo(owner, name).issues.get(number);
+  // Closes an issue by hand, or as a merged PR naming it would.
+  closeIssue(owner: string, name: string, number: number, { byMergedPullRequest = false } = {}): void {
+    const repo = this.repo(owner, name);
+    const issue = repo.issues.get(number);
     if (!issue) throw new Error(`no issue #${number} on ${owner}/${name}`);
     issue.state = 'closed';
+    if (byMergedPullRequest) repo.closedByMerge.add(number);
+  }
+
+  // Until released, CI on every repo stays unfinished: getChecks does not answer.
+  holdChecks(): void {
+    if (!this.checksHeld) this.checksHeld = Promise.withResolvers<void>();
+  }
+
+  releaseChecks(): void {
+    this.checksHeld?.resolve();
+    this.checksHeld = undefined;
   }
 
   issue(owner: string, name: string, number: number): Issue | undefined {
@@ -76,12 +92,11 @@ export class FakeGitHub implements GitHub {
     return { ...issue };
   }
 
-  async getBlockers(owner: string, name: string, number: number): Promise<Issue[]> {
+  async getBlockers(owner: string, name: string, number: number): Promise<Blocker[]> {
     const repo = this.repo(owner, name);
     return (repo.blockedBy.get(number) ?? []).map((n) => {
-      const issue = repo.issues.get(n);
-      if (!issue) throw new Error(`no issue #${n} on ${owner}/${name}`);
-      return { ...issue };
+      if (!repo.issues.has(n)) throw new Error(`no issue #${n} on ${owner}/${name}`);
+      return { number: n, merged: repo.closedByMerge.has(n) };
     });
   }
 
@@ -94,6 +109,7 @@ export class FakeGitHub implements GitHub {
   }
 
   async getChecks(owner: string, name: string, _ref: string): Promise<ChecksState> {
+    while (this.checksHeld) await this.checksHeld.promise;
     return this.repo(owner, name).checks;
   }
 
@@ -105,7 +121,10 @@ export class FakeGitHub implements GitHub {
     // Like GitHub: a merged PR closes the issues its body names with "Closes #n".
     for (const match of pr.body.matchAll(/\bCloses #(\d+)\b/gi)) {
       const issue = repo.issues.get(Number(match[1]));
-      if (issue) issue.state = 'closed';
+      if (issue) {
+        issue.state = 'closed';
+        repo.closedByMerge.add(issue.number);
+      }
     }
   }
 

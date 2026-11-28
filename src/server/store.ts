@@ -1,7 +1,6 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
 import { DatabaseSync } from 'node:sqlite';
 import type {
-  Agent,
   Door,
   ModelTier,
   ParallelLimits,
@@ -232,12 +231,6 @@ export class Store {
       )
       .all() as Row[];
     return rows.map(toTicket);
-  }
-
-  runningPerAgent(): Record<Agent, number> {
-    const counts: Record<Agent, number> = { claude: 0, codex: 0 };
-    for (const t of this.listTickets()) if (t.state === 'running') counts[t.tier.agent]++;
-    return counts;
   }
 
   parallelLimits(): ParallelLimits {
