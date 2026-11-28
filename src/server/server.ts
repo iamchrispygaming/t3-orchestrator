@@ -16,6 +16,7 @@ import { systemClock, type Clock } from './clock.ts';
 import { resolveDataFolder } from './data-folder.ts';
 import { Engine } from './engine.ts';
 import type { GitHub } from './github.ts';
+import { silentNotifier, type Notifier } from './notifier.ts';
 import { Store } from './store.ts';
 
 export type ServerDeps = {
@@ -23,6 +24,7 @@ export type ServerDeps = {
   github: GitHub;
   agentRunner: AgentRunner;
   clock?: Clock;
+  notifier?: Notifier;
   log?: (message: string, error?: unknown) => void;
 };
 
@@ -40,6 +42,7 @@ export function createServer(deps: ServerDeps): Server {
     github: deps.github,
     agentRunner: deps.agentRunner,
     clock: deps.clock ?? systemClock,
+    notifier: deps.notifier ?? silentNotifier,
     dataFolder,
     log: deps.log ?? ((message, error) => console.error(message, error)),
   });

@@ -9,6 +9,7 @@ import type { Door, ModelTier, RegisterTicketRequest, TargetRepo, Ticket, Ticket
 import { reviewOutcomeSchema, runOutcomeSchema, type AgentRunner, type RunMode } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
 import type { GitHub } from './github.ts';
+import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
 import { RepoWorkspace } from './workspace.ts';
 
@@ -21,6 +22,7 @@ export type EngineDeps = {
   github: GitHub;
   agentRunner: AgentRunner;
   clock: Clock;
+  notifier: Notifier; // nothing notifies yet: an auto-merge never does
   dataFolder: string;
   log: (message: string, error?: unknown) => void;
 };
@@ -39,7 +41,8 @@ export function branchName(issueNumber: number, title: string): string {
     .replace(/^-+|-+$/g, '')
     .slice(0, 40)
     .replace(/-+$/, '');
-  return `t3o/${issueNumber}${slug ? `-${slug}` : ''}`;
+  // A title with no ASCII letters or digits still gets a slug.
+  return `t3o/${issueNumber}-${slug || 'issue'}`;
 }
 
 function publicTicket({ body: _body, ...ticket }: StoredTicket): Ticket {

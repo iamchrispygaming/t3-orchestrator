@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createServer, type Server } from '../src/server/server.ts';
 import type { ModelTier, TicketState } from '../src/shared/api.ts';
@@ -8,6 +8,7 @@ import { createApiClient } from '../src/web/api.ts';
 import { approve, done, FakeAgentRunner } from './support/fake-agent-runner.ts';
 import { FakeClock } from './support/fake-clock.ts';
 import { FakeGitHub } from './support/fake-github.ts';
+import { FakeNotifier } from './support/fake-notifier.ts';
 import { commitFile, createBareRemote } from './support/git.ts';
 
 const tier: ModelTier = { agent: 'claude', model: 'haiku', effort: 'medium' };
@@ -19,6 +20,7 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
   let github: FakeGitHub;
   let agent: FakeAgentRunner;
   let clock: FakeClock;
+  let notifier: FakeNotifier;
   let servers: Server[];
 
   beforeEach(() => {
@@ -29,6 +31,7 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     github.addIssue('acme', 'widgets', { number: 7, title: 'Add a greeting file!', body: 'Write hello.txt.' });
     agent = new FakeAgentRunner();
     clock = new FakeClock('2026-01-01T09:00:00.000Z');
+    notifier = new FakeNotifier();
     servers = [];
   });
 
@@ -37,13 +40,13 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function start() {
-    const server = createServer({ env: { T3O_DATA_DIR: dataDir }, github, agentRunner: agent, clock });
+  function start(dataDirOverride: string = dataDir) {
+    const server = createServer({ env: { T3O_DATA_DIR: dataDirOverride }, github, agentRunner: agent, clock, notifier });
     servers.push(server);
     return createApiClient((path, init) => Promise.resolve(server.app.request(path, init)));
   }
 
-  async function runToMerged() {
+  async function runToMerged({ issueNumber = 7, dataDirOverride = dataDir } = {}) {
     const seenByAgent: { branches: string[]; pulls: number }[] = [];
     agent.script('run', (req) => {
       commitFile(req.cwd, 'hello.txt', 'hello\n', 'Add hello.txt');
@@ -56,12 +59,12 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
       return approve();
     });
 
-    const api = start();
+    const api = start(dataDirOverride);
     const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
     const events = await api.events();
     expect((await events.next()).type).toBe('snapshot');
 
-    const ticket = await api.registerTicket({ repoId: repo.id, issueNumber: 7, tier, door: 'two-way' });
+    const ticket = await api.registerTicket({ repoId: repo.id, issueNumber, tier, door: 'two-way' });
     const states: TicketState[] = [];
     while (states.at(-1) !== 'merged') {
       const event = await events.next();
@@ -92,6 +95,20 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     expect(agent.calls.map((c) => c.mode)).toEqual(['run', 'review']);
   });
 
+  it('notifies nothing when a Two-way Ticket merges itself', async () => {
+    await runToMerged();
+
+    expect(notifier.sent).toEqual([]);
+  });
+
+  it('still names the branch t3o/<issue#>-<slug> when the title has no ASCII letters or digits', async () => {
+    github.addIssue('acme', 'widgets', { number: 8, title: '日本語', body: 'Write hello.txt.' });
+
+    await runToMerged({ issueNumber: 8 });
+
+    expect(github.pulls('acme', 'widgets')[0]?.head).toBe('t3o/8-issue');
+  });
+
   it('keeps the Run and Review records (tier, times, outcome) across a restart', async () => {
     const { ticket } = await runToMerged();
     for (const server of servers.splice(0)) await server.close();
@@ -114,5 +131,13 @@ describe('a hand-made Two-way Ticket on the fake Agent', () => {
     expect(existsSync(join(dataDir, 'repos', 'acme', 'widgets', 'git'))).toBe(true);
     const repoDir = join(dataDir, 'repos', 'acme', 'widgets');
     expect(agent.calls[0]).toMatchObject({ cwd: join(repoDir, 'work', '7'), scratchDir: join(repoDir, 'scratch', '7') });
+  });
+
+  it('accepts a data folder override relative to the working directory', async () => {
+    const { states } = await runToMerged({ dataDirOverride: relative(process.cwd(), dataDir) });
+
+    expect(states.at(-1)).toBe('merged');
+    expect(existsSync(join(dataDir, 't3o.db'))).toBe(true);
+    expect(existsSync(join(dataDir, 'repos', 'acme', 'widgets', 'git'))).toBe(true);
   });
 });
