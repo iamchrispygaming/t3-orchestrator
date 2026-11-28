@@ -27,6 +27,7 @@ import {
   type RunOutcome,
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
+import { deleteRunLogs } from './data-folder.ts';
 import type { GitHub } from './github.ts';
 import type { Notifier } from './notifier.ts';
 import type { Store, StoredTicket } from './store.ts';
@@ -36,6 +37,11 @@ export const RUN_TIME_LIMIT_MS = 60 * 60_000;
 
 export class NotYetHandled extends Error {}
 
+// A command the Orchestrator turns down as things stand (HTTP 409).
+export class Refused extends Error {}
+
+export class NotFound extends Error {}
+
 export type EngineDeps = {
   store: Store;
   github: GitHub;
@@ -44,6 +50,8 @@ export type EngineDeps = {
   notifier: Notifier; // nothing notifies yet: an auto-merge never does
   dataFolder: string;
   log: (message: string, error?: unknown) => void;
+  // Stops the Target Repo's Planner work and waits until it has let go of the repo's folder.
+  stopPlannerWork: (repoId: number) => Promise<void>;
 };
 
 type Call = 'one-way' | 'two-way' | 'unclear';
@@ -75,6 +83,7 @@ export class Engine {
   // Agent executions in progress: a slot is held from the Run's start until the
   // Agent returns, not while the Orchestrator pushes, opens the PR and waits on CI.
   private slotsInUse: Record<Agent, number> = { claude: 0, codex: 0 };
+  private repoLocks = new Map<string, Promise<void>>();
   private deps: EngineDeps;
 
   constructor(deps: EngineDeps) {
@@ -90,10 +99,55 @@ export class Engine {
     return this.deps.store.listTickets().map(publicTicket);
   }
 
+  targetRepos(): TargetRepo[] {
+    return this.deps.store.listTargetRepos();
+  }
+
+  // Adding and removing one repo never overlap: each takes that repo's lock and
+  // checks again inside it, before it touches the repo's folder.
   async addTargetRepo(owner: string, name: string): Promise<TargetRepo> {
-    const info = await this.deps.github.getRepo(owner, name);
-    await new RepoWorkspace(this.deps.dataFolder, owner, name).clone(info.cloneUrl);
-    return this.deps.store.addTargetRepo({ owner, name, defaultBranch: info.defaultBranch });
+    return this.withRepoLock(owner, name, async () => {
+      const { store, github, dataFolder } = this.deps;
+      const live = store.findTargetRepo(owner, name);
+      if (live) throw new Refused(`${live.owner}/${live.name} is already a Target Repo`);
+      const info = await github.getRepo(owner, name);
+      // No live Target Repo owns this folder (checked above, under the lock), so the
+      // clone may clear out whatever a failed clone or removal left there.
+      await new RepoWorkspace(dataFolder, owner, name).clone(info.cloneUrl);
+      return store.addTargetRepo({ owner, name, defaultBranch: info.defaultBranch });
+    });
+  }
+
+  // Deletes the Target Repo's clone, worktrees, scratch folders and Run logs. Its
+  // Tickets' Runs and Reviews stay on record, so Cost estimates keep their history.
+  // The repo stays listed until cleanup has finished, so a failed cleanup can be retried;
+  // from the moment cleanup starts it takes no new work, across restarts too.
+  async removeTargetRepo(id: number): Promise<void> {
+    const found = this.deps.store.getTargetRepo(id);
+    if (!found) throw new NotFound(`no Target Repo ${id}`);
+    await this.withRepoLock(found.owner, found.name, async () => {
+      const { store, clock, dataFolder } = this.deps;
+      const repo = store.getTargetRepo(id);
+      if (!repo) throw new NotFound(`no Target Repo ${id}`);
+      // A Review works in the Ticket's worktree too, so it blocks removal like a Run.
+      const busy = store.listTicketsOfRepo(id).find((t) => t.state === 'running' || t.state === 'reviewing');
+      if (busy) {
+        const now = busy.state === 'running' ? 'Running' : 'Reviewing';
+        throw new Refused(
+          `${repo.owner}/${repo.name} can't be removed while its Tickets are Running: #${busy.issueNumber} is ${now}`,
+        );
+      }
+      store.markTargetRepoRemoving(id, clock.now()); // no new Ticket or Plan from here
+      await this.deps.stopPlannerWork(id);
+      await new RepoWorkspace(dataFolder, repo.owner, repo.name).remove();
+      await deleteRunLogs(dataFolder, store.listRunIds(id));
+      store.markTargetRepoRemoved(id, clock.now());
+    });
+  }
+
+  ticket(id: number): Ticket | undefined {
+    const ticket = this.deps.store.getTicket(id);
+    return ticket && publicTicket(ticket);
   }
 
   async registerTicket({ repoId, ...ticket }: RegisterTicketRequest): Promise<Ticket> {
@@ -106,7 +160,8 @@ export class Engine {
   async registerApprovedPlan(req: RegisterApprovedPlanRequest): Promise<ApprovedPlan> {
     const { store, github, clock } = this.deps;
     const repo = store.getTargetRepo(req.repoId);
-    if (!repo) throw new Error(`no Target Repo ${req.repoId}`);
+    if (!repo) throw new NotFound(`no Target Repo ${req.repoId}`);
+    if (store.isTargetRepoRemoving(repo.id)) throw new Refused(`${repo.owner}/${repo.name} is being removed`);
     const entries = await Promise.all(
       req.tickets.map(async (entry) => ({
         entry,
@@ -116,6 +171,13 @@ export class Engine {
         blockers: await github.getBlockers(repo.owner, repo.name, entry.issueNumber),
       })),
     );
+
+    // The repo may have been removed while GitHub answered (a re-add gets a new id, so
+    // this registration stays removed). From this check until the Tickets exist nothing
+    // awaits, and the scheduler never starts a Ticket on a repo being removed.
+    if (!store.getTargetRepo(repo.id) || store.isTargetRepoRemoving(repo.id)) {
+      throw new Refused(`${repo.owner}/${repo.name} was removed while the Ticket was being registered`);
+    }
 
     const { plan, ids } = store.transaction(() => {
       const plan = store.addApprovedPlan(repo.id, clock.now());
@@ -159,6 +221,21 @@ export class Engine {
   async stop(): Promise<void> {
     this.stopping.abort();
     while (this.inFlight.size > 0) await Promise.allSettled([...this.inFlight]);
+  }
+
+  private async withRepoLock<T>(owner: string, name: string, task: () => Promise<T>): Promise<T> {
+    const key = `${owner}/${name}`.toLowerCase(); // GitHub ignores case in owner/repo
+    const previous = this.repoLocks.get(key) ?? Promise.resolve();
+    const result = previous.then(task);
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.repoLocks.set(key, settled);
+    void settled.then(() => {
+      if (this.repoLocks.get(key) === settled) this.repoLocks.delete(key);
+    });
+    return result;
   }
 
   private track(work: Promise<void>): void {
@@ -220,7 +297,14 @@ export class Engine {
   private async work(id: number): Promise<void> {
     const { store, github, clock } = this.deps;
     const ticket = store.getTicket(id)!;
-    const repo = store.getTargetRepo(ticket.repoId)!;
+    const repo = store.getTargetRepo(ticket.repoId);
+    // A Ticket never starts on a Target Repo that is gone or being removed (the ready
+    // queue already leaves those out): hand the slot back and leave the Ticket Ready.
+    if (!repo || store.isTargetRepoRemoving(repo.id)) {
+      this.setState(id, 'ready');
+      this.freeSlot(ticket.tier.agent);
+      return;
+    }
     const workspace = new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name);
 
     let folders: TicketFolders;

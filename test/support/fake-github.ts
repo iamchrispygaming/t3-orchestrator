@@ -27,9 +27,25 @@ export class FakeGitHub implements GitHub {
   private repos = new Map<string, FakeRepo>();
   private nextNumber = 1000;
   private checksHeld: PromiseWithResolvers<void> | undefined;
+  private issueGate: Promise<void> | null = null;
+  private issueLookupStarted: (() => void) | null = null;
+
+  // Holds issue lookups until release(); `started` resolves when one is waiting.
+  holdIssueLookups(): { started: Promise<void>; release: () => void } {
+    let release!: () => void;
+    this.issueGate = new Promise<void>((resolve) => (release = resolve));
+    const started = new Promise<void>((resolve) => (this.issueLookupStarted = resolve));
+    return {
+      started,
+      release: () => {
+        this.issueGate = null;
+        release();
+      },
+    };
+  }
 
   addRepo(owner: string, name: string, remotePath: string, defaultBranch = 'main'): void {
-    this.repos.set(`${owner}/${name}`, {
+    this.repos.set(`${owner}/${name}`.toLowerCase(), {
       info: { defaultBranch, cloneUrl: remotePath },
       issues: new Map(),
       blockedBy: new Map(),
@@ -90,6 +106,10 @@ export class FakeGitHub implements GitHub {
   }
 
   async getIssue(owner: string, name: string, number: number): Promise<Issue> {
+    if (this.issueGate) {
+      this.issueLookupStarted?.();
+      await this.issueGate;
+    }
     const issue = this.repo(owner, name).issues.get(number);
     if (!issue) throw new Error(`no issue #${number} on ${owner}/${name}`);
     return { ...issue };
@@ -134,7 +154,8 @@ export class FakeGitHub implements GitHub {
   }
 
   private repo(owner: string, name: string): FakeRepo {
-    const repo = this.repos.get(`${owner}/${name}`);
+    // Like GitHub, owner and repo names match whatever their case.
+    const repo = this.repos.get(`${owner}/${name}`.toLowerCase());
     if (!repo) throw new Error(`no repo ${owner}/${name}`);
     return repo;
   }

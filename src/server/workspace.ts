@@ -4,6 +4,7 @@ import { execFile } from 'node:child_process';
 import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { repoFolder } from './data-folder.ts';
 
 const run = promisify(execFile);
 
@@ -35,12 +36,17 @@ export class RepoWorkspace {
   readonly root: string;
   private readonly gitDir: string;
 
+  // One folder per repo whatever the spelling: GitHub ignores case in owner/repo,
+  // and so do the default Windows and macOS filesystems.
   constructor(dataFolder: string, owner: string, name: string) {
-    this.root = join(dataFolder, 'repos', owner, name);
+    this.root = repoFolder(dataFolder, owner, name);
     this.gitDir = join(this.root, 'git');
   }
 
+  // Recursively deletes whatever is in the repo's folder first (left by a failed clone
+  // or removal). The caller must make sure no live Target Repo owns that folder.
   async clone(url: string): Promise<void> {
+    await this.remove();
     await mkdir(this.root, { recursive: true });
     await git(this.root, 'clone', '--bare', url, this.gitDir);
     // A bare clone maps remote branches onto local ones; track them as origin/* instead
@@ -83,6 +89,11 @@ export class RepoWorkspace {
     await rm(worktree, { recursive: true, force: true });
     await rm(scratch, { recursive: true, force: true });
     await git(this.gitDir, 'worktree', 'prune');
+  }
+
+  // Deletes the clone along with every worktree and scratch folder.
+  async remove(): Promise<void> {
+    await rm(this.root, { recursive: true, force: true, maxRetries: 5 });
   }
 
   // Only the Orchestrator pushes; Agents just commit in their worktree.
