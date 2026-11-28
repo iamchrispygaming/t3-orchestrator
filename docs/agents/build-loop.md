@@ -32,14 +32,16 @@ Done when every claimed ticket has a worker running.
 
 Code is always reviewed by a **reviewer**: a fresh agent that did not write it and starts with no memory of the work (on a different model from the worker when the tool offers one). The lead never reviews either. When a worker reports green tests, start a reviewer with this brief:
 
-> Review PR <url> for issue #<n> following `engineering/code-review` (paths in `docs/agents/where-things-live.md`; read `AGENTS.md`, `GLOSSARY.md`, `docs/adr/` and the Spec first). You only read: change no code. Post your findings as one PR comment, and give a verdict: **approve** or **changes needed**, plus your own door call (one-way / two-way).
+> Review PR <url> for issue #<n> following `engineering/code-review` (paths in `docs/agents/where-things-live.md`; read `AGENTS.md`, `GLOSSARY.md`, `docs/adr/` and the Spec first). You only read: change no code. Block only on (a) an acceptance criterion of the ticket that isn't met, or (b) a defect that could lose the user's work or data, or merge or push something wrong. File every other finding as a new build ticket (`ready-for-agent`, sub-issue of the Spec, body linking the Spec and this PR) instead of blocking on it. Post your findings as one PR comment, marking each **blocking** or **follow-up #<n>**, and give a verdict: **approve** (no blocking findings) or **changes needed**, plus your own door call (one-way / two-way).
 
 Done when the reviewer has posted its comment and verdict.
+
+The narrow bar is the user's decision (2026-11-28): reviewers kept finding fresh edge cases every round, so tickets ran out of rounds without the acceptance criteria being in doubt. Edge cases still get built, as follow-up tickets.
 
 ### 4. Land each reviewed PR
 
 - **Changes needed, or tests red**: send the findings to the worker that wrote the code, then run a **new** reviewer on the result. After two rounds of changes needed, unassign the ticket, comment what went wrong, add `needs-info`, and leave it for the user.
-- **Approved, two-way**: the door is two-way only when both the worker and the reviewer call it two-way. Merge with `gh pr merge <pr> --squash --delete-branch` once CI (if any) is green. The issue closes through `Closes #<n>`.
+- **Approved, two-way**: the door is two-way only when both the worker and the reviewer call it two-way. Merge with `gh pr merge <pr> --squash --delete-branch` once CI (if any) is green. If `main` moved since the review, have the worker rebase and rerun the tests first; a rebase with real conflict resolution gets a fresh reviewer. The issue closes through `Closes #<n>`.
 - **Approved, one-way** (either call says one-way, or a call is missing): leave the PR open, comment "One-way door: waiting for the user to merge", and move on. Its dependents stay blocked until the user merges it.
 
 Then go back to step 2. A merge can unblock new frontier tickets.
