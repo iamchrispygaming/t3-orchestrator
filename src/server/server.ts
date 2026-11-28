@@ -1,0 +1,101 @@
+// The Orchestrator's HTTP + SSE API (Hono). Tests drive it in-process through
+// `app.request`; the real process will serve the same app on 127.0.0.1.
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { Hono } from 'hono';
+import { streamSSE } from 'hono/streaming';
+import type { z } from 'zod';
+import {
+  addTargetRepoRequestSchema,
+  registerTicketRequestSchema,
+  type ServerEvent,
+  type TicketDetail,
+} from '../shared/api.ts';
+import type { AgentRunner } from './agent-runner.ts';
+import { systemClock, type Clock } from './clock.ts';
+import { resolveDataFolder } from './data-folder.ts';
+import { Engine } from './engine.ts';
+import type { GitHub } from './github.ts';
+import { Store } from './store.ts';
+
+export type ServerDeps = {
+  env: Record<string, string | undefined>;
+  github: GitHub;
+  agentRunner: AgentRunner;
+  clock?: Clock;
+  log?: (message: string, error?: unknown) => void;
+};
+
+export type Server = {
+  app: Hono;
+  close(): Promise<void>;
+};
+
+export function createServer(deps: ServerDeps): Server {
+  const dataFolder = resolveDataFolder(deps.env);
+  mkdirSync(dataFolder, { recursive: true });
+  const store = new Store(join(dataFolder, 't3o.db'));
+  const engine = new Engine({
+    store,
+    github: deps.github,
+    agentRunner: deps.agentRunner,
+    clock: deps.clock ?? systemClock,
+    dataFolder,
+    log: deps.log ?? ((message, error) => console.error(message, error)),
+  });
+  const openStreams = new Set<() => void>();
+
+  const app = new Hono();
+
+  async function parseBody<S extends z.ZodType>(body: Promise<unknown>, schema: S) {
+    return schema.safeParse(await body.catch(() => undefined));
+  }
+
+  app.onError((error, c) => c.json({ error: error.message }, 500));
+
+  app.post('/api/repos', async (c) => {
+    const req = await parseBody(c.req.json(), addTargetRepoRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(await engine.addTargetRepo(req.data.owner, req.data.name), 201);
+  });
+
+  app.post('/api/tickets', async (c) => {
+    const req = await parseBody(c.req.json(), registerTicketRequestSchema);
+    if (!req.success) return c.json({ error: req.error.message }, 400);
+    return c.json(await engine.registerTicket(req.data), 201);
+  });
+
+  app.get('/api/tickets/:id', (c) => {
+    const id = Number(c.req.param('id'));
+    const ticket = engine.tickets().find((t) => t.id === id);
+    if (!ticket) return c.json({ error: `no Ticket ${id}` }, 404);
+    const detail: TicketDetail = { ...ticket, runs: store.listRuns(id), reviews: store.listReviews(id) };
+    return c.json(detail);
+  });
+
+  app.get('/api/events', (c) =>
+    streamSSE(c, async (stream) => {
+      let queue = Promise.resolve();
+      const send = (event: ServerEvent) => {
+        queue = queue.then(() => stream.writeSSE({ event: event.type, data: JSON.stringify(event) }));
+      };
+      const unsubscribe = engine.subscribe((ticket) => send({ type: 'ticket', ticket }));
+      send({ type: 'snapshot', tickets: engine.tickets() });
+      await new Promise<void>((resolve) => {
+        openStreams.add(resolve);
+        stream.onAbort(resolve);
+      });
+      unsubscribe();
+      await queue.catch(() => undefined);
+    }),
+  );
+
+  return {
+    app,
+    async close() {
+      await engine.stop();
+      for (const end of openStreams) end();
+      store.close();
+    },
+  };
+}
