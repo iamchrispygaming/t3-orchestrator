@@ -22,6 +22,7 @@ import { systemClock, type Clock } from './clock.ts';
 import { resolveDataFolder } from './data-folder.ts';
 import { Engine, NotFound, Refused } from './engine.ts';
 import { GhNotLoggedIn, type GhAuth } from './gh-auth.ts';
+import { Housekeeping } from './housekeeping.ts';
 import type { GitHub } from './github.ts';
 import { silentNotifier, type Notifier } from './notifier.ts';
 import { PlanBusy, Planner, PlanNotFound } from './planner.ts';
@@ -59,7 +60,7 @@ export async function startServer(deps: StartDeps): Promise<Server> {
 export function createServer(deps: ServerDeps): Server {
   const dataFolder = resolveDataFolder(deps.env);
   mkdirSync(dataFolder, { recursive: true });
-  const store = new Store(join(dataFolder, 't3o.db'));
+  const store = new Store(join(dataFolder, 't3o.db'), { backupsFolder: join(dataFolder, 'backups') });
   const engine = new Engine({
     store,
     github: deps.github,
@@ -78,6 +79,13 @@ export function createServer(deps: ServerDeps): Server {
     log: deps.log ?? ((message, error) => console.error(message, error)),
   });
   planner.resume();
+  const housekeeping = new Housekeeping({
+    store,
+    clock: deps.clock ?? systemClock,
+    dataFolder,
+    log: deps.log ?? ((message, error) => console.error(message, error)),
+  });
+  housekeeping.start();
   const openStreams = new Set<() => void>();
 
   const app = new Hono();
@@ -138,7 +146,12 @@ export function createServer(deps: ServerDeps): Server {
     return c.json(detail);
   });
 
-  const settings = () => settingsSchema.parse({ plannerTier: planner.plannerTier(), ...engine.settings() });
+  const settings = () =>
+    settingsSchema.parse({
+      plannerTier: planner.plannerTier(),
+      logRetentionDays: store.logRetentionDays(),
+      ...engine.settings(),
+    });
 
   app.get('/api/settings', (c) => c.json(settings()));
 
@@ -146,8 +159,9 @@ export function createServer(deps: ServerDeps): Server {
   app.put('/api/settings', async (c) => {
     const req = await parseBody(c.req.json(), updateSettingsRequestSchema);
     if (!req.success) return c.json({ error: req.error.message }, 400);
-    const { plannerTier, ...escalation } = req.data;
+    const { plannerTier, logRetentionDays, ...escalation } = req.data;
     if (plannerTier) planner.setPlannerTier(plannerTier);
+    if (logRetentionDays !== undefined) store.setLogRetentionDays(logRetentionDays);
     engine.updateSettings(escalation);
     return c.json(settings());
   });
@@ -208,7 +222,7 @@ export function createServer(deps: ServerDeps): Server {
   return {
     app,
     async close() {
-      await Promise.all([engine.stop(), planner.stop()]);
+      await Promise.all([housekeeping.stop(), engine.stop(), planner.stop()]);
       for (const end of openStreams) end();
       store.close();
     },

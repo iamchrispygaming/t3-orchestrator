@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { startServer, type Server } from '../src/server/server.ts';
 import type { ModelTier, TicketState } from '../src/shared/api.ts';
@@ -12,6 +11,7 @@ import { FakeGhAuth } from './support/fake-gh-auth.ts';
 import { FakeGitHub } from './support/fake-github.ts';
 import { FakeNotifier } from './support/fake-notifier.ts';
 import { commitFile, createBareRemote, git } from './support/git.ts';
+import { writeSchemaV1Database } from './support/old-data-folder.ts';
 
 const tier: ModelTier = { agent: 'claude', model: 'haiku', effort: 'medium' };
 const TOKEN = 'gho_fakeTokenThatMustNeverReachTheDisk';
@@ -187,27 +187,15 @@ describe('Target Repos', () => {
 
     it('folds case-variant Target Repos left by an older data folder into one, keeping its Tickets and Runs', async () => {
       // A data folder at schema version 1, before spellings were compared without case.
-      mkdirSync(dataDir, { recursive: true });
-      const db = new DatabaseSync(join(dataDir, 't3o.db'));
-      db.exec(`CREATE TABLE target_repos (
-                 id INTEGER PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL,
-                 default_branch TEXT NOT NULL, UNIQUE (owner, name));
-               CREATE TABLE tickets (id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES target_repos(id),
-                 issue_number INTEGER NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, branch TEXT NOT NULL,
-                 tier TEXT NOT NULL, door TEXT NOT NULL, state TEXT NOT NULL, pr_number INTEGER,
-                 UNIQUE (repo_id, issue_number));
-               CREATE TABLE runs (id INTEGER PRIMARY KEY, ticket_id INTEGER NOT NULL REFERENCES tickets(id),
-                 tier TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, outcome TEXT, reason TEXT);
-               CREATE TABLE reviews (id INTEGER PRIMARY KEY, ticket_id INTEGER NOT NULL REFERENCES tickets(id),
-                 tier TEXT NOT NULL, started_at TEXT NOT NULL, ended_at TEXT, verdict TEXT, findings TEXT);
-               INSERT INTO target_repos (owner, name, default_branch) VALUES ('acme', 'widgets', 'main');
-               INSERT INTO target_repos (owner, name, default_branch) VALUES ('Acme', 'Widgets', 'main');
-               INSERT INTO tickets VALUES (1, 1, 7, 'Add a greeting file', 'Write hello.txt.', 't3o/7-add-a-greeting-file',
-                 '{"agent":"claude","model":"haiku","effort":"medium"}', 'two-way', 'merged', 1000);
-               INSERT INTO runs VALUES (1, 1, '{"agent":"claude","model":"haiku","effort":"medium"}',
-                 '2026-01-01T09:00:00.000Z', '2026-01-01T09:05:00.000Z', 'done', '');
-               PRAGMA user_version = 1;`);
-      db.close();
+      writeSchemaV1Database(
+        dataDir,
+        `INSERT INTO target_repos (owner, name, default_branch) VALUES ('acme', 'widgets', 'main');
+         INSERT INTO target_repos (owner, name, default_branch) VALUES ('Acme', 'Widgets', 'main');
+         INSERT INTO tickets VALUES (1, 1, 7, 'Add a greeting file', 'Write hello.txt.', 't3o/7-add-a-greeting-file',
+           '{"agent":"claude","model":"haiku","effort":"medium"}', 'two-way', 'merged', 1000);
+         INSERT INTO runs VALUES (1, 1, '{"agent":"claude","model":"haiku","effort":"medium"}',
+           '2026-01-01T09:00:00.000Z', '2026-01-01T09:05:00.000Z', 'done', '');`,
+      );
 
       const api = await start();
 
@@ -258,11 +246,8 @@ describe('Target Repos', () => {
       const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
       scriptMergingRun();
       await registerTicket(api, repo.id, 'merged');
-      expect(existsSync(join(repoDir(), 'work', '7'))).toBe(true);
-      expect(existsSync(join(repoDir(), 'scratch', '7'))).toBe(true);
       // Run logs live at logs/<run-id>.jsonl; the first Run in a fresh data folder is Run 1.
-      mkdirSync(join(dataDir, 'logs'), { recursive: true });
-      writeFileSync(join(dataDir, 'logs', '1.jsonl'), '{}\n');
+      expect(existsSync(join(dataDir, 'logs', '1.jsonl'))).toBe(true);
       writeFileSync(join(dataDir, 'logs', '999.jsonl'), '{}\n');
 
       await api.removeTargetRepo(repo.id);
@@ -312,7 +297,8 @@ describe('Target Repos', () => {
       const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
       scriptMergingRun();
       await registerTicket(api, repo.id, 'merged');
-      // A folder where Run 1's log should be: deleting the log fails.
+      // A folder in place of Run 1's log: deleting the log fails.
+      rmSync(join(dataDir, 'logs', '1.jsonl'));
       mkdirSync(join(dataDir, 'logs', '1.jsonl', 'stuck'), { recursive: true });
 
       await expect(api.removeTargetRepo(repo.id)).rejects.toThrow(/500/);
@@ -331,6 +317,7 @@ describe('Target Repos', () => {
       const repo = await api.addTargetRepo({ owner: 'acme', name: 'widgets' });
       scriptMergingRun();
       await registerTicket(api, repo.id, 'merged');
+      rmSync(join(dataDir, 'logs', '1.jsonl'));
       mkdirSync(join(dataDir, 'logs', '1.jsonl', 'stuck'), { recursive: true }); // log deletion fails
       await expect(api.removeTargetRepo(repo.id)).rejects.toThrow(/500/);
       github.addIssue('acme', 'widgets', { number: 8, title: 'Another', body: 'More.' });

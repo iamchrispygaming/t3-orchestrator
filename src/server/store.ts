@@ -1,4 +1,6 @@
 // The SQLite store (`node:sqlite`): one file, forward migrations at startup.
+import { mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { Blocker } from './github.ts';
 import type {
@@ -119,6 +121,18 @@ const migrations: string[] = [
   `ALTER TABLE runs ADD COLUMN failure_note TEXT;
    ALTER TABLE tickets ADD COLUMN handback_reason TEXT;
    ALTER TABLE tickets ADD COLUMN published_head TEXT;`,
+  // Housekeeping. finished_at: when the Ticket was Merged or cancelled, which starts
+  // its Run logs' retention; a Ticket Merged before this migration counts from its
+  // last Run or Review. logs_deleted_at: its Run logs are gone (the records stay).
+  `ALTER TABLE tickets ADD COLUMN finished_at TEXT;
+   ALTER TABLE tickets ADD COLUMN logs_deleted_at TEXT;
+   UPDATE tickets SET finished_at = (
+       SELECT max(at) FROM (
+         SELECT ended_at AS at FROM runs WHERE runs.ticket_id = tickets.id
+         UNION ALL SELECT ended_at FROM reviews WHERE reviews.ticket_id = tickets.id
+       )
+     )
+     WHERE state = 'merged';`,
 ];
 
 // Run outcomes that are not failures: the next Run's instructions skip past them
@@ -126,6 +140,8 @@ const migrations: string[] = [
 const NOT_FAILURES: RunOutcomeKind[] = ['quota-hit', 'interrupted'];
 
 export const defaultParallelLimits: ParallelLimits = { claude: 2, codex: 2 };
+export const defaultLogRetentionDays = 30;
+export const BACKUPS_KEPT = 3;
 
 export type StoredApprovedPlan = { id: number; repoId: number; approvedAt: string };
 
@@ -156,18 +172,21 @@ export type StoredPlan = {
 export class Store {
   private db: DatabaseSync;
 
-  constructor(path: string) {
+  // `backupsFolder` gets a copy of the database before each startup that migrates it.
+  constructor(path: string, { backupsFolder }: { backupsFolder?: string } = {}) {
     this.db = new DatabaseSync(path);
     this.db.exec('PRAGMA foreign_keys = ON');
-    this.migrate();
+    this.migrate(backupsFolder);
   }
 
   close(): void {
     this.db.close();
   }
 
-  private migrate(): void {
+  private migrate(backupsFolder: string | undefined): void {
     const { user_version: applied } = this.db.prepare('PRAGMA user_version').get() as { user_version: number };
+    // A new database (version 0) holds nothing to lose.
+    if (backupsFolder && applied > 0 && applied < migrations.length) this.backUp(backupsFolder, applied);
     // SQLite's way to rebuild a table others point at: foreign keys off (it can't be
     // switched inside a transaction), then every reference checked before committing.
     this.db.exec('PRAGMA foreign_keys = OFF');
@@ -188,6 +207,21 @@ export class Store {
     } finally {
       this.db.exec('PRAGMA foreign_keys = ON');
     }
+  }
+
+  // Copies the database to `<folder>/t3o-<n>-v<version>.db`, n counting up, and
+  // keeps the last BACKUPS_KEPT. VACUUM INTO writes a consistent copy of the open file.
+  private backUp(folder: string, version: number): void {
+    mkdirSync(folder, { recursive: true });
+    const numbered = (files: string[]) =>
+      files
+        .map((file) => ({ file, n: Number(/^t3o-(\d+)-v\d+\.db$/.exec(file)?.[1]) }))
+        .filter((b) => Number.isInteger(b.n))
+        .sort((a, b) => a.n - b.n);
+    const next = (numbered(readdirSync(folder)).at(-1)?.n ?? 0) + 1;
+    this.db.prepare('VACUUM INTO ?').run(join(folder, `t3o-${String(next).padStart(4, '0')}-v${version}.db`));
+    const backups = numbered(readdirSync(folder));
+    for (const { file } of backups.slice(0, -BACKUPS_KEPT)) rmSync(join(folder, file), { force: true });
   }
 
   // Every registration gets a fresh id, even for a repo that was added and removed before.
@@ -371,6 +405,48 @@ export class Store {
     if (change.publishedHead !== undefined) {
       this.db.prepare('UPDATE tickets SET published_head = ? WHERE id = ?').run(change.publishedHead, id);
     }
+  }
+
+  // Merged (or, later, cancelled): the Ticket's work is over, from `at`.
+  finishTicket(id: number, state: Extract<TicketState, 'merged'>, at: Date): void {
+    this.db.prepare('UPDATE tickets SET state = ?, finished_at = ? WHERE id = ?').run(state, at.toISOString(), id);
+  }
+
+  // Finished Tickets whose finish is at or before `cutoff` and whose Run logs are still kept.
+  ticketLogsFinishedBefore(cutoff: Date): { ticketId: number; runIds: number[] }[] {
+    const tickets = this.db
+      .prepare('SELECT id FROM tickets WHERE finished_at <= ? AND logs_deleted_at IS NULL ORDER BY id')
+      .all(cutoff.toISOString()) as Row[];
+    const runs = this.db.prepare('SELECT id FROM runs WHERE ticket_id = ? ORDER BY id');
+    return tickets.map((t) => ({
+      ticketId: Number(t.id),
+      runIds: (runs.all(Number(t.id)) as Row[]).map((r) => Number(r.id)),
+    }));
+  }
+
+  markTicketLogsDeleted(ticketId: number, at: Date): void {
+    this.db.prepare('UPDATE tickets SET logs_deleted_at = ? WHERE id = ?').run(at.toISOString(), ticketId);
+  }
+
+  // Finished Tickets on Target Repos neither removed nor being removed: a removed
+  // repo's folder may already belong to a newer registration of the same repo.
+  finishedTicketsOnLiveRepos(): { id: number; owner: string; name: string; issueNumber: number }[] {
+    const rows = this.db
+      .prepare(
+        `SELECT t.id, r.owner, r.name, t.issue_number FROM tickets t JOIN target_repos r ON r.id = t.repo_id
+         WHERE t.finished_at IS NOT NULL AND r.removing_since IS NULL AND r.removed_at IS NULL ORDER BY t.id`,
+      )
+      .all() as Row[];
+    return rows.map((r) => ({ id: Number(r.id), owner: String(r.owner), name: String(r.name), issueNumber: Number(r.issue_number) }));
+  }
+
+  logRetentionDays(): number {
+    return (this.getSetting('logRetentionDays') as number | undefined) ?? defaultLogRetentionDays;
+  }
+
+  setLogRetentionDays(days: number): number {
+    this.setSetting('logRetentionDays', days);
+    return this.logRetentionDays();
   }
 
   startRun(ticketId: number, tier: ModelTier, startedAt: Date): number {

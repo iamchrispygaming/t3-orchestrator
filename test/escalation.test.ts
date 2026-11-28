@@ -103,6 +103,7 @@ describe('Escalation', () => {
       plannerTier: opus,
       ladder: [haiku, solLow, sonnet, solHigh, opus, astra],
       runTimeLimitMinutes: 60,
+      logRetentionDays: 30,
     });
   });
 

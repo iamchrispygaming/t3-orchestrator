@@ -1,4 +1,4 @@
-import { rm } from 'node:fs/promises';
+import { appendFile, mkdir, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -42,6 +42,13 @@ export function folderName(part: string): string {
 
 export function runLogPath(dataFolder: string, runId: number): string {
   return join(dataFolder, 'logs', `${runId}.jsonl`);
+}
+
+// One line of a Run's raw Agent output.
+export async function appendRunLog(dataFolder: string, runId: number, event: unknown): Promise<void> {
+  await mkdir(join(dataFolder, 'logs'), { recursive: true });
+  await appendFile(runLogPath(dataFolder, runId), `${JSON.stringify(event)}
+`);
 }
 
 export async function deleteRunLogs(dataFolder: string, runIds: number[]): Promise<void> {

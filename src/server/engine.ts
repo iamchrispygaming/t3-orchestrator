@@ -33,7 +33,7 @@ import {
   type RunOutcome,
 } from './agent-runner.ts';
 import type { Clock } from './clock.ts';
-import { deleteRunLogs } from './data-folder.ts';
+import { appendRunLog, deleteRunLogs } from './data-folder.ts';
 import type { FailedJob, GitHub } from './github.ts';
 import { DEFAULT_ESCALATION_SETTINGS, nextTier, tierLabel } from './ladder.ts';
 import type { Notifier } from './notifier.ts';
@@ -358,8 +358,10 @@ export class Engine {
   // itself or through every other issue its PR closed. Re-read each Waiting
   // Ticket's blockers from GitHub, the same evidence registration uses.
   private async merged(ticket: StoredTicket): Promise<void> {
-    const { store, github } = this.deps;
-    this.setState(ticket.id, 'merged');
+    const { store, github, clock } = this.deps;
+    await this.removeTicketFolders(ticket); // before Merged shows, so it never shows with them
+    store.finishTicket(ticket.id, 'merged', clock.now());
+    this.emit(ticket.id);
     for (const waiting of store.waitingTickets()) {
       try {
         const repo = store.getTargetRepo(waiting.repoId)!;
@@ -372,6 +374,18 @@ export class Engine {
       }
     }
     this.schedule();
+  }
+
+  // A Merged (or cancelled) Ticket's worktree and scratch folder go; a failed delete
+  // is left for the next cleanup.
+  private async removeTicketFolders(ticket: StoredTicket): Promise<void> {
+    const repo = this.deps.store.getTargetRepo(ticket.repoId);
+    if (!repo) return;
+    try {
+      await new RepoWorkspace(this.deps.dataFolder, repo.owner, repo.name).removeTicket(ticket.issueNumber);
+    } catch (error) {
+      this.deps.log(`Could not delete the worktree of Ticket ${ticket.id}`, error);
+    }
   }
 
   private emitOutput(id: number, text: string): void {
@@ -452,7 +466,7 @@ export class Engine {
       const instructions = runInstructions(ticket, store.lastFailureNote(id));
       runId = store.startRun(id, ticket.tier, clock.now());
       this.emit(id);
-      agentEnd = await this.runAgent('run', id, ticket.tier, folders, runOutcomeSchema, instructions, runTimeLimitMinutes);
+      agentEnd = await this.runAgent('run', id, ticket.tier, folders, runOutcomeSchema, instructions, runTimeLimitMinutes, runId);
     } finally {
       this.freeSlot(ticket.tier.agent);
     }
@@ -620,6 +634,7 @@ export class Engine {
     schema: S,
     instructions: string,
     timeLimitMinutes: number,
+    runId?: number, // a Run's raw output is kept in its Run log; a Review's is not
   ): Promise<AgentEnd<z.infer<S>>> {
     const timeoutMs = timeLimitMinutes * 60_000;
     const timeLimit = new AbortController();
@@ -652,6 +667,12 @@ export class Engine {
         const step = await Promise.race([iterator.next(), aborted]);
         if (step === 'aborted' || step.done) break;
         const event = step.value;
+        // A log that can't be written costs the log, never the Run.
+        if (runId !== undefined) {
+          await appendRunLog(this.deps.dataFolder, runId, event).catch((error) =>
+            this.deps.log(`Could not write the log of Run ${runId}`, error),
+          );
+        }
         if (event.type === 'text') this.emitOutput(ticketId, event.text);
         if (event.type === 'rate-limit' && event.status === 'rejected') quotaHit = true;
         if (event.type === 'result' && result === undefined) result = schema.parse(event.result);

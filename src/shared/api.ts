@@ -217,7 +217,11 @@ export const escalationSettingsSchema = z.object({
 });
 export type EscalationSettings = z.infer<typeof escalationSettingsSchema>;
 
-export const settingsSchema = escalationSettingsSchema.extend({ plannerTier: modelTierSchema });
+export const settingsSchema = escalationSettingsSchema.extend({
+  plannerTier: modelTierSchema,
+  // Days Run logs are kept after their Ticket is Merged or cancelled.
+  logRetentionDays: z.number().int().min(1),
+});
 export type Settings = z.infer<typeof settingsSchema>;
 
 // PUT /api/settings changes only the settings it names.

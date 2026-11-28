@@ -77,6 +77,16 @@ export class RepoWorkspace {
     });
   }
 
+  // Deletes the Ticket's worktree and scratch folder; its branch stays in the clone.
+  removeTicket(issueNumber: number): Promise<void> {
+    return serially(this.gitDir, async () => {
+      const { worktree, scratch } = this.ticketFolders(issueNumber);
+      await rm(worktree, { recursive: true, force: true, maxRetries: 5 });
+      await rm(scratch, { recursive: true, force: true, maxRetries: 5 });
+      await git(this.gitDir, 'worktree', 'prune');
+    });
+  }
+
   async commitsAhead(branch: string, defaultBranch: string): Promise<number> {
     return Number(await git(this.gitDir, 'rev-list', '--count', `origin/${defaultBranch}..${branch}`));
   }
