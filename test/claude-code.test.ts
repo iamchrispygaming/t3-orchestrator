@@ -158,6 +158,50 @@ describe('ClaudeStream: the final result becomes a RunResult', () => {
     stream.push(line({ type: 'system', subtype: 'init' }));
     expect(stream.end()).toBeUndefined();
   });
+
+  const doneRun = { status: 'done', reason: '', prBody: 'b', door: 'two-way', blastRadius: 'x' };
+
+  it('turns a done Run into a failure when the process then exits non-zero', () => {
+    const stream = new ClaudeStream('run');
+    stream.push(resultLine({ structured_output: doneRun }));
+    expect(stream.end({ code: 1, signal: null })).toEqual({
+      kind: 'run',
+      status: 'failed',
+      reason: 'claude exited with code 1 after reporting done',
+      prBody: 'b',
+      door: 'unclear',
+      blastRadius: 'x',
+      usage: { inputTokens: 2000, outputTokens: 450, costUsd: 0.42 },
+    });
+  });
+
+  it('turns a done Run into a failure when the process is killed', () => {
+    const stream = new ClaudeStream('run');
+    stream.push(resultLine({ structured_output: doneRun }));
+    expect(stream.end({ code: null, signal: 'SIGKILL' })).toMatchObject({
+      status: 'failed',
+      reason: 'claude was killed by SIGKILL after reporting done',
+      door: 'unclear',
+    });
+  });
+
+  it('turns an approving Review into an unclear one when the process exits non-zero', () => {
+    const stream = new ClaudeStream('review');
+    stream.push(resultLine({ structured_output: { verdict: 'approve', findings: 'Fine.', door: 'two-way' } }));
+    expect(stream.end({ code: 143, signal: null })).toEqual({
+      kind: 'review',
+      verdict: 'unclear',
+      findings: 'claude exited with code 143 after reporting approve. Fine.',
+      door: 'unclear',
+      usage: { inputTokens: 2000, outputTokens: 450, costUsd: 0.42 },
+    });
+  });
+
+  it('keeps the result as reported when the process exits cleanly', () => {
+    const stream = new ClaudeStream('run');
+    stream.push(resultLine({ structured_output: doneRun }));
+    expect(stream.end({ code: 0, signal: null })).toMatchObject({ status: 'done', door: 'two-way' });
+  });
 });
 
 describe('agentResultSchema: what the Agent is asked to fill', () => {
@@ -216,7 +260,6 @@ describe('buildClaudeEnv: the environment a Run starts with', () => {
       'npm_token',
       'DB_PASSWORD',
       'SSH_AUTH_SOCK',
-      'GIT_ASKPASS',
     ]) {
       expect(env, name).not.toHaveProperty(name);
     }
@@ -229,16 +272,46 @@ describe('buildClaudeEnv: the environment a Run starts with', () => {
   });
 
   it('gives Git no saved login and no prompts', () => {
-    const env = buildClaudeEnv(base, scratch);
+    const env = buildClaudeEnv({ ...base, GIT_SSH: 'plink.exe', SSH_ASKPASS: 'ask.exe' }, scratch);
     expect(env).toMatchObject({
       GIT_TERMINAL_PROMPT: '0',
       GCM_INTERACTIVE: 'never',
-      // An empty credential.helper clears every helper set in system, global or repo config.
-      GIT_CONFIG_COUNT: '1',
+      // Set but empty, so Git stops looking and never falls back to core.askPass or SSH_ASKPASS.
+      GIT_ASKPASS: '',
+      SSH_ASKPASS: '',
+      SSH_ASKPASS_REQUIRE: 'never',
+      // The user's global and system config (credential helpers, askPass, sshCommand) are not read.
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: join(scratch, 'git', 'config'),
+      // Command-line scope beats the repo's own config too: empty values clear both.
+      GIT_CONFIG_COUNT: '5',
       GIT_CONFIG_KEY_0: 'credential.helper',
       GIT_CONFIG_VALUE_0: '',
-      GIT_SSH_COMMAND: 'ssh -o BatchMode=yes -o IdentityAgent=none',
+      GIT_CONFIG_KEY_1: 'core.askPass',
+      GIT_CONFIG_VALUE_1: '',
+      // Programs a Run could plant in the repo's config to run under a read-only Review.
+      GIT_CONFIG_KEY_2: 'core.fsmonitor',
+      GIT_CONFIG_VALUE_2: 'false',
+      GIT_CONFIG_KEY_3: 'core.pager',
+      GIT_CONFIG_VALUE_3: 'cat',
+      GIT_CONFIG_KEY_4: 'diff.external',
+      GIT_CONFIG_VALUE_4: '',
+      // No ssh config, no agent and no identity files.
+      GIT_SSH_COMMAND: 'ssh -F none -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityFile=none -o IdentityAgent=none',
+      GIT_SSH_VARIANT: 'ssh',
     });
+    expect(env).not.toHaveProperty('GIT_SSH');
+  });
+
+  it('carries the commit identity over from the isolated-away Git config', () => {
+    const env = buildClaudeEnv(base, scratch, { name: 'Ada', email: 'ada@example.com' });
+    expect(env).toMatchObject({
+      GIT_AUTHOR_NAME: 'Ada',
+      GIT_AUTHOR_EMAIL: 'ada@example.com',
+      GIT_COMMITTER_NAME: 'Ada',
+      GIT_COMMITTER_EMAIL: 'ada@example.com',
+    });
+    expect(buildClaudeEnv(base, scratch)).not.toHaveProperty('GIT_AUTHOR_NAME');
   });
 
   it("points TEMP and package caches at the Ticket's scratch folder, replacing any casing", () => {
@@ -262,7 +335,12 @@ describe('buildClaudeEnv: the environment a Run starts with', () => {
 
 describe('buildClaudeArgs: how claude -p is started', () => {
   const resultSchema = z.toJSONSchema(runOutcomeSchema) as Record<string, unknown>;
-  const req = (mode: RunMode) => ({ tier: { agent: 'claude' as const, model: 'sonnet', effort: 'medium' }, mode, resultSchema });
+  const req = (mode: RunMode) => ({
+    tier: { agent: 'claude' as const, model: 'sonnet', effort: 'medium' },
+    mode,
+    resultSchema,
+    cwd: '/data/t3o/repos/o/r/work/41',
+  });
   const flag = (args: string[], name: string) => {
     const at = args.indexOf(name);
     return at === -1 ? undefined : args[at + 1];
@@ -309,19 +387,100 @@ describe('buildClaudeArgs: how claude -p is started', () => {
     );
   });
 
+  // Edit rules match like .gitignore, where a matching folder covers everything inside it,
+  // and a deny rule wins over everything. So they name concrete places, never a whole tree
+  // the worktree might sit in.
+  it('denies Edit and Write on login, config and shell-startup files in the home folder', () => {
+    const rules = permissions(buildClaudeArgs(req('run'), '/home/me'));
+    expect(rules.deny).toEqual(
+      expect.arrayContaining([
+        'Edit(~/.ssh/**)',
+        'Edit(~/.gitconfig)',
+        'Edit(~/.git-credentials)',
+        'Edit(~/.config/**)',
+        'Edit(~/.claude/**)',
+        'Edit(~/.claude.json)',
+        'Edit(~/.codex/**)',
+        'Edit(~/.npmrc)',
+        'Edit(~/.bashrc)',
+        'Edit(~/.profile)',
+        'Edit(~/AppData/Roaming/**)',
+      ]),
+    );
+  });
+
+  it('drops any Edit rule that would cover the worktree itself', () => {
+    const posix = permissions(buildClaudeArgs({ ...req('run'), cwd: '/home/me/.config/t3o/repos/o/r/work/41' }, '/home/me'));
+    expect(posix.deny).not.toContain('Edit(~/.config/**)');
+    expect(posix.deny).toContain('Edit(~/.ssh/**)');
+
+    const windows = permissions(
+      buildClaudeArgs({ ...req('run'), cwd: 'C:\\Users\\Me\\AppData\\Roaming\\t3o\\repos\\o\\r\\work\\41' }, 'C:\\Users\\me'),
+    );
+    expect(windows.deny).not.toContain('Edit(~/AppData/Roaming/**)');
+    expect(windows.deny).toContain('Edit(~/.ssh/**)');
+  });
+
+  it('denies the obvious shell writes outside the worktree', () => {
+    const rules = permissions(buildClaudeArgs(req('run')));
+    expect(rules.deny).toEqual(
+      expect.arrayContaining([
+        'Bash(git config --global *)',
+        'Bash(git config --system *)',
+        'Bash(npm install -g *)',
+        'Bash(npm i -g *)',
+        'Bash(*> ~*)',
+        'Bash(*>> ~*)',
+        'Bash(*> ../*)',
+        'Bash(*>> ../*)',
+        'Bash(cp * ../*)',
+        'Bash(mv * ~*)',
+        'Bash(tee ../*)',
+        'Bash(rm * /*)',
+      ]),
+    );
+  });
+
   it('keeps Reviews and the Planner read-only', () => {
     for (const mode of ['review', 'plan'] as const) {
       const args = buildClaudeArgs(req(mode));
       expect(flag(args, '--permission-mode')).toBe('dontAsk');
+      // Edit and Write are not even available.
+      expect(flag(args, '--tools')).toBe('Read,Grep,Glob,Bash');
       const rules = permissions(args);
-      expect(rules.allow).not.toContain('Bash');
-      expect(rules.allow).toContain('Bash(git diff *)');
       expect(rules.deny).toEqual(expect.arrayContaining(['Edit', 'Write', 'NotebookEdit', 'Bash(git push *)', 'Bash(gh *)']));
+    }
+  });
+
+  it('lets Reviews and the Planner run only read-only git commands that cannot run configured programs', () => {
+    const rules = permissions(buildClaudeArgs(req('review')));
+    expect(rules.allow).toEqual([
+      'Bash(git status)',
+      'Bash(git status --short)',
+      'Bash(git --no-pager diff --no-ext-diff --no-textconv *)',
+      'Bash(git --no-pager log --no-ext-diff --no-textconv *)',
+      'Bash(git --no-pager show --no-ext-diff --no-textconv *)',
+    ]);
+    // Options and shell syntax that would write a file even through an allowed prefix.
+    expect(rules.deny).toEqual(expect.arrayContaining(['Bash(*--output*)', 'Bash(*>*)', 'Bash(* --ext-diff*)', 'Bash(* --textconv*)']));
+  });
+
+  it('stops ambient settings, hooks and MCP servers from widening Reviews and the Planner', () => {
+    for (const mode of ['review', 'plan'] as const) {
+      const args = buildClaudeArgs(req(mode));
+      // No user, project or local settings: their allow rules, hooks and plugins are never loaded.
+      expect(flag(args, '--setting-sources')).toBe('');
+      expect(args).toContain('--strict-mcp-config');
     }
   });
 
   it('tells the Agent the house rules in its system prompt', () => {
     expect(flag(buildClaudeArgs(req('run')), '--append-system-prompt')).toMatch(/commit/i);
     expect(flag(buildClaudeArgs(req('review')), '--append-system-prompt')).toMatch(/read-only/i);
+    for (const mode of ['review', 'plan'] as const) {
+      expect(flag(buildClaudeArgs(req(mode)), '--append-system-prompt')).toContain(
+        'git --no-pager diff --no-ext-diff --no-textconv',
+      );
+    }
   });
 });

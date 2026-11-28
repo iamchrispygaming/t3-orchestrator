@@ -30,22 +30,29 @@ The server has no entry point and no real GitHub client yet, so this drives the 
 
 ## What to check
 
+If `claude` refuses to start, check first that it still accepts every flag in `buildClaudeArgs` (`claude --help`). The read-only modes pass `--setting-sources ""`, `--strict-mcp-config` and `--tools Read,Grep,Glob,Bash`, which the research notes don't cover; they come from the CLI reference.
+
 In the `run` section:
 
 - [ ] `TEXT` and `TOOL` lines stream while it works (e.g. `TOOL {"name":"Bash","detail":"git commit ..."}`).
 - [ ] `RESULT` has `"kind": "run"`, `"status": "done"`, and `usage` with non-zero tokens and a `costUsd`.
-- [ ] `git log` in the throwaway repo shows the SMOKE.md commit.
+- [ ] `git log` in the throwaway repo shows the SMOKE.md commit, authored with your usual name and email.
 - [ ] `reason` says `git push` and `gh auth status` were refused by permissions (not that they ran and failed for lack of a login).
-- [ ] `reason` says writing `../outside-the-worktree.txt` was refused, and the file does not exist.
+- [ ] `reason` says the file-tool write, `echo x > ../outside-shell.txt` and `git config --global` were all refused. Neither file exists next to the repo, and your `~/.gitconfig` is unchanged.
+- [ ] `reason` says both `git ls-remote` calls failed with no prompt and no saved key or credential used (e.g. `Permission denied (publickey)` and `could not read Username`).
 - [ ] `reason` lists no token/key/secret variables (`none`), and the temp folder is inside the printed `scratch` folder.
 - [ ] The run never stopped to ask you anything.
 
 In the `review` section:
 
-- [ ] `RESULT` has `"kind": "review"`, a `verdict` (`approve` expected), and `findings` saying the edit was refused.
-- [ ] `git status` in the throwaway repo is clean: the Review changed nothing.
+- [ ] `RESULT` has `"kind": "review"`, a `verdict` (`approve` expected), and `findings` saying the edit, `--output`, the redirect, the plain `git diff` and `touch` were all refused.
+- [ ] `git status` in the throwaway repo is clean, and neither `x.txt` nor `y.txt` exists next to it: the Review changed nothing.
 
 If any `RATE-LIMIT` line appears, note its `status`, `resetsAt` and `utilization`. The event shape comes from the Agent SDK reference and hasn't been seen in a real stream yet; report what you see on the PR or issue so the quota port can rely on it.
+
+## What this does not prove
+
+Permission rules are a guard rail, not a sandbox (the Spec leaves an OS sandbox out of v1). In a Run, any program the Agent starts (a build, an install script, `node -e`, `python`) can still write anywhere your user account can. The deny rules only catch shell writes whose shape gives them away: redirection to `~` or `..`, `cp`/`mv`/`tee`/`rm` into `~`, `..` or `/`, global installs and `git config --global`. Edit and Write outside the worktree are refused because they would need a prompt, and the deny rules also name the home folder's login, config and shell-startup files. Reviews and the Planner have no such gap: their only shell commands are the fixed read-only `git` forms.
 
 ## Clean up
 
