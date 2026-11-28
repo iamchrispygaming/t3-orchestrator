@@ -411,6 +411,8 @@ export class ClaudeStream {
     const result = this.last;
     if (!result || (exit.code === 0 && exit.signal === null)) return result;
     const how = exit.signal ? `was killed by ${exit.signal}` : `exited with code ${String(exit.code)}`;
+    // A Planner turn that ends badly has no partial answer worth keeping: report no result.
+    if (result.kind === 'plan') return undefined;
     if (result.kind === 'review') {
       const findings = `claude ${how} after reporting ${result.verdict}.${result.findings ? ` ${result.findings}` : ''}`;
       return { ...result, verdict: 'unclear', findings, door: 'unclear' };
