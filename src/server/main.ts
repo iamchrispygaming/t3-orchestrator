@@ -30,6 +30,9 @@ export function startOrchestrator({ open }: { open: boolean }): void {
     github: unwiredGitHub,
     agentRunner: unwiredAgentRunner,
     webRoot: WEB_ROOT,
+    port,
+    // `npm run dev` names Vite's dev server, whose proxy forwards the browser's Origin.
+    devOrigins: process.env.T3O_DEV_ORIGINS?.split(',').filter(Boolean),
   });
   const http = serve({ fetch: server.app.fetch, hostname: '127.0.0.1', port }, () => {
     console.log(`T3 Orchestrator is running at ${url}  (Ctrl+C stops it)`);
