@@ -4,7 +4,7 @@ Builds [Spec: T3 Orchestrator v1](https://github.com/iamchrispygaming/t3-orchest
 
 ## Vocabulary
 
-- **Build ticket**: an open issue labelled `ready-for-agent` whose body links the Spec. (`wayfinder:*` issues are planning records, never build tickets.)
+- **Build ticket**: an open issue labelled `ready-for-agent` whose body links the Spec. The Spec itself (#20) also carries `ready-for-agent` but is never a build ticket: drop it from every query. (`wayfinder:*` issues are planning records, never build tickets.)
 - **Frontier**: build tickets that are unassigned and have no open blocker. Query:
   ```
   gh issue list --label ready-for-agent --state open --search "no:assignee" --json number,title
